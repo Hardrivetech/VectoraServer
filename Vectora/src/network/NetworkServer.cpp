@@ -54,6 +54,7 @@ void NetworkServer::start() {
     SOCKET clientSocket;
     sockaddr_in clientAddr;
     int clientAddrSize = sizeof(clientAddr);
+
     auto clientHandler = [](SOCKET clientSocket) {
         std::cout << "[Network] Client connected!" << std::endl;
         PacketHandler handler;
@@ -61,7 +62,7 @@ void NetworkServer::start() {
         int bytesReceived = recv(clientSocket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
         if (bytesReceived > 0) {
             std::vector<uint8_t> data(buffer, buffer + bytesReceived);
-            handler.handle(data);
+            handler.handle(data, &clientSocket);
         } else {
             std::cout << "[Network] No data received or connection closed." << std::endl;
         }
