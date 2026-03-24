@@ -13,7 +13,7 @@
 
 class PacketHandler {
 public:
-    void handle(const std::vector<uint8_t>& data, void* socketPtr = nullptr);
+    void handle(const std::vector<uint8_t>& data, void* socketPtr = nullptr, struct ClientState* clientState = nullptr);
 private:
     void sendLoginSuccess(const std::string& username, void* socketPtr);
     void sendLoginFinished(void* socketPtr);

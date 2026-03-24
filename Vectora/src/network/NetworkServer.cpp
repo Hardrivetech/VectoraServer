@@ -4,6 +4,7 @@
 #include <winsock2.h>
 #endif
 #include "protocol/PacketHandler.h"
+#include "protocol/ClientState.h"
 #include <vector>
 #include <thread>
 
@@ -58,6 +59,7 @@ void NetworkServer::start() {
     auto clientHandler = [](SOCKET clientSocket) {
         std::cout << "[Network] Client connected!" << std::endl;
         PacketHandler handler;
+        ClientState clientState; // Per-client protocol state
         uint8_t buffer[4096];
         std::vector<uint8_t> packetBuffer;
         while (true) {
@@ -68,7 +70,7 @@ void NetworkServer::start() {
                 while (!packetBuffer.empty()) {
                     // Pass the entire buffer to handler; handler should process one packet and return
                     size_t before = packetBuffer.size();
-                    handler.handle(packetBuffer, &clientSocket);
+                    handler.handle(packetBuffer, &clientSocket, &clientState);
                     // If handler did not consume any bytes, break to avoid infinite loop
                     if (packetBuffer.size() == before) break;
                 }

@@ -4,9 +4,10 @@
 #include "world/AnvilRegion.h"
 #include "world/ChunkParser.h"
 #include "world/ChunkSerializer.h"
+#include "protocol/ClientState.h"
 
 
-void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr) {
+void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, ClientState* clientState) {
     std::cout << "[Protocol] Handling packet of size " << data.size() << " bytes" << std::endl;
     if (data.empty()) return;
     // Make a non-const copy so we can erase processed bytes
@@ -25,6 +26,7 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr) {
         } while (byte & 0x80);
         return true;
     };
+    // Helper lambdas
     auto readString = [&](std::string& out) -> bool {
         int len = 0;
         if (!readVarInt(len)) return false;
@@ -39,7 +41,7 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr) {
         offset += 2;
         return val;
     };
-
+    // Read packet length and packetId
     int packetLength = 0;
     if (!readVarInt(packetLength)) {
         std::cout << "[Protocol] Failed to read packet length (VarInt)" << std::endl;
@@ -50,16 +52,13 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr) {
         std::cout << "[Protocol] Failed to read packet ID (VarInt)" << std::endl;
         return;
     }
-    size_t packet_start = 0;
-    std::cout << "[Protocol] Packet ID: 0x" << std::hex << packetId << std::dec << std::endl;
-    if (packetId != 0x00) {
-        std::cout << "[Protocol] Received non-handshake packet ID: 0x" << std::hex << packetId << std::dec << std::endl;
+    if (!clientState) {
+        std::cerr << "[Protocol] ERROR: clientState is null!" << std::endl;
+        return;
     }
-
     if (packetId == 0x00) {
-        // Handshake or login start
+        // If this is a handshake, parse handshake as before
         if (offset < data.size()) {
-            // Try to read as handshake (protocol version is VarInt, server address is String, port is UShort, next state is VarInt)
             int protocolVersion = 0;
             size_t save_offset = offset;
             if (readVarInt(protocolVersion)) {
@@ -72,80 +71,123 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr) {
                                   << ", serverAddress=" << serverAddress
                                   << ", serverPort=" << serverPort
                                   << ", nextState=" << nextState << std::endl;
-                        // TODO: Store state for login/status
-                        // Erase processed bytes (handshake packet)
+                        clientState->statusState = (nextState == 1);
                         buffer.erase(buffer.begin(), buffer.begin() + offset);
                         return;
                     }
                 }
             }
-            // If not handshake, reset offset and try login start
             offset = save_offset;
-            std::string username;
-            if (readString(username)) {
-                std::cout << "[Protocol] Login Start: username=" << username << std::endl;
-                // Proceed to Play state: send Login Success, Join Game, Player Position, and Chunk Data
-
-                this->sendLoginSuccess(username, socketPtr);
-                this->sendLoginFinished(socketPtr);
-                this->sendJoinGame(username, socketPtr);
-                this->sendPlayerPositionAndLook(socketPtr);
-
-
-                // --- Chunk sending logic ---
-                // Load region and chunk (hardcoded to 0,0 for demo)
-                std::string regionPath = "world/region/r.0.0.mca";
-                AnvilRegion region(regionPath);
-                if (region.isValid()) {
-                    auto chunkData = region.loadChunk(0, 0);
-                    if (chunkData) {
-                        auto chunk = parseChunk(chunkData);
-                        if (chunk) {
-                            auto chunkPacket = serializeChunkData(chunk);
-                            // Prepend Chunk Data packet ID (0x22 for 1.21.11)
-                            auto pid = encodeVarInt(0x22);
-                            chunkPacket.insert(chunkPacket.begin(), pid.begin(), pid.end());
-                            // Prepend length
-                            auto plen = encodeVarInt((int)chunkPacket.size());
-                            chunkPacket.insert(chunkPacket.begin(), plen.begin(), plen.end());
-                            SOCKET sock = *(SOCKET*)socketPtr;
-                            send(sock, reinterpret_cast<const char*>(chunkPacket.data()), (int)chunkPacket.size(), 0);
-                            std::cout << "[Protocol] Sent Chunk Data (0,0)" << std::endl;
-                        } else {
-                            std::cout << "[Protocol] Failed to parse chunk (0,0)" << std::endl;
-                        }
-                    } else {
-                        std::cout << "[Protocol] Failed to load chunk data (0,0)" << std::endl;
-                    }
-                } else {
-                    std::cout << "[Protocol] Region file not valid: " << regionPath << std::endl;
-                }
-                // Erase processed bytes (login start packet)
-                buffer.erase(buffer.begin(), buffer.begin() + offset);
-                return;
-            } else {
-                std::cout << "[Protocol] Did not parse Login Start after handshake. Data left: " << (data.size() - offset) << " bytes." << std::endl;
-            }
-            // Erase processed bytes (failed login start attempt)
+        }
+        // If in status state and no payload remains, this is a status request
+        if (clientState->statusState && offset == data.size()) {
+            SOCKET sock = *(SOCKET*)socketPtr;
+            std::string motd = "{\"version\":{\"name\":\"1.21.1\",\"protocol\":774},\"players\":{\"max\":20,\"online\":0,\"sample\":[]},\"description\":{\"text\":\"Vectora C++ Server\"}}";
+            std::vector<uint8_t> packet;
+            auto pid = encodeVarInt(0x00);
+            packet.insert(packet.end(), pid.begin(), pid.end());
+            auto motdStr = encodeString(motd);
+            packet.insert(packet.end(), motdStr.begin(), motdStr.end());
+            auto plen = encodeVarInt((int)packet.size());
+            packet.insert(packet.begin(), plen.begin(), plen.end());
+            send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+            std::cout << "[Protocol] Sent server list MOTD/status response" << std::endl;
             buffer.erase(buffer.begin(), buffer.begin() + offset);
             return;
         }
-
-    } else if (packetId == 0x21) { // Keep Alive (clientbound is 0x21, serverbound is 0x0F in 1.19+)
+        // Ping request (packetId 0x01): respond with same payload
+        if (clientState->statusState && data.size() > 0 && data[0] == 0x01) {
+            SOCKET sock = *(SOCKET*)socketPtr;
+            if (data.size() >= 9) {
+                std::vector<uint8_t> packet;
+                auto pid = encodeVarInt(0x01);
+                packet.insert(packet.end(), pid.begin(), pid.end());
+                packet.insert(packet.end(), data.begin() + 1, data.begin() + 9);
+                auto plen = encodeVarInt((int)packet.size());
+                packet.insert(packet.begin(), plen.begin(), plen.end());
+                send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+                std::cout << "[Protocol] Sent server list ping response (pong)" << std::endl;
+            }
+            buffer.erase(buffer.begin(), buffer.begin() + offset);
+            return;
+        }
+        // Otherwise, try login start
+        std::string username;
+        if (readString(username)) {
+            std::cout << "[Protocol] Login Start: username=" << username << std::endl;
+            clientState->statusState = false;
+            this->sendLoginSuccess(username, socketPtr);
+            this->sendLoginFinished(socketPtr);
+            this->sendJoinGame(username, socketPtr);
+            this->sendPlayerPositionAndLook(socketPtr);
+            // --- Chunk sending logic ---
+            std::string regionPath = "world/region/r.0.0.mca";
+            AnvilRegion region(regionPath);
+            if (region.isValid()) {
+                auto chunkData = region.loadChunk(0, 0);
+                if (chunkData) {
+                    auto chunk = parseChunk(chunkData);
+                    if (chunk) {
+                        auto chunkPacket = serializeChunkData(chunk);
+                        auto pid = encodeVarInt(0x22);
+                        chunkPacket.insert(chunkPacket.begin(), pid.begin(), pid.end());
+                        auto plen = encodeVarInt((int)chunkPacket.size());
+                        chunkPacket.insert(chunkPacket.begin(), plen.begin(), plen.end());
+                        SOCKET sock = *(SOCKET*)socketPtr;
+                        send(sock, reinterpret_cast<const char*>(chunkPacket.data()), (int)chunkPacket.size(), 0);
+                        std::cout << "[Protocol] Sent Chunk Data (0,0)" << std::endl;
+                    } else {
+                        std::cout << "[Protocol] Failed to parse chunk (0,0)" << std::endl;
+                    }
+                } else {
+                    std::cout << "[Protocol] Failed to load chunk data (0,0)" << std::endl;
+                }
+            } else {
+                std::cout << "[Protocol] Region file not valid: " << regionPath << std::endl;
+            }
+            buffer.erase(buffer.begin(), buffer.begin() + offset);
+            return;
+        } else {
+            std::cout << "[Protocol] Did not parse Login Start after handshake. Data left: " << (data.size() - offset) << " bytes." << std::endl;
+        }
+        buffer.erase(buffer.begin(), buffer.begin() + offset);
+        return;
+    }
+    else if (packetId == 0x21) { // Keep Alive (clientbound is 0x21, serverbound is 0x0F in 1.19+)
         // Try to read keep-alive ID (long)
         if (offset + 8 <= data.size()) {
             int64_t keepAliveId = 0;
             for (int i = 0; i < 8; ++i) {
                 keepAliveId = (keepAliveId << 8) | data[offset++];
             }
-            std::cout << "[Protocol] Received Keep Alive, echoing back ID: " << keepAliveId << std::endl;
+            std::cout << "[Protocol] Received Keep Alive (clientbound), echoing back ID: " << keepAliveId << std::endl;
             sendKeepAliveResponse(keepAliveId, socketPtr);
-            // Erase processed bytes (keep alive)
             buffer.erase(buffer.begin(), buffer.begin() + offset);
             return;
+        } else {
+            std::cout << "[Protocol] Malformed Keep Alive (clientbound) packet, expected 8 bytes for ID." << std::endl;
         }
     }
-    std::cout << "[Protocol] Unhandled packet ID: 0x" << std::hex << packetId << std::dec << std::endl;
+    else if (packetId == 0x0F) { // Keep Alive (serverbound in 1.19+)
+        // Try to read keep-alive ID (long)
+        if (offset + 8 <= data.size()) {
+            int64_t keepAliveId = 0;
+            for (int i = 0; i < 8; ++i) {
+                keepAliveId = (keepAliveId << 8) | data[offset++];
+            }
+            std::cout << "[Protocol] Received Keep Alive (serverbound), ID: " << keepAliveId << std::endl;
+            // Optionally, respond or update last-seen timestamp here
+            buffer.erase(buffer.begin(), buffer.begin() + offset);
+            return;
+        } else {
+            std::cout << "[Protocol] Malformed Keep Alive (serverbound) packet, expected 8 bytes for ID." << std::endl;
+        }
+    }
+    std::cout << "[Protocol] Unhandled packet ID: 0x" << std::hex << packetId << std::dec << ", raw bytes: ";
+    for (size_t i = 0; i < data.size(); ++i) {
+        printf("%02X ", data[i]);
+    }
+    std::cout << std::endl;
     // Erase processed bytes (unhandled packet)
     buffer.erase(buffer.begin(), buffer.begin() + offset);
 }
@@ -205,6 +247,7 @@ void PacketHandler::sendPlayerPositionAndLook(void* socketPtr) {
     auto plen = encodeVarInt((int)packet.size());
     packet.insert(packet.begin(), plen.begin(), plen.end());
     send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+    Sleep(10); // Small delay to prevent packet coalescing
     std::cout << "[Protocol] Sent Player Position and Look" << std::endl;
     // Debug: print raw bytes
     std::cout << "[Protocol] Player Position and Look packet bytes: ";
@@ -313,6 +356,7 @@ void PacketHandler::sendJoinGame(const std::string& username, void* socketPtr) {
     packet.insert(packet.begin(), plen.begin(), plen.end());
     // Send
     send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+    Sleep(10); // Small delay to prevent packet coalescing
     // Debug: print raw bytes
     std::cout << "[Protocol] Join Game packet bytes: ";
     for (size_t i = 0; i < packet.size(); ++i) {
@@ -336,23 +380,28 @@ void PacketHandler::sendLoginSuccess(const std::string& username, void* socketPt
 #ifdef _WIN32
     if (!socketPtr) return;
     SOCKET sock = *(SOCKET*)socketPtr;
-    // Login Success packet: 0x02 (packet id), UUID (string), username (string)
-    std::string fakeUUID = "00000000-0000-0000-0000-000000000000";
+    // Login Success packet: 0x02 (packet id), UUID (16 bytes), username (string)
     std::vector<uint8_t> packet;
     // Packet ID
     auto pid = encodeVarInt(0x02);
     packet.insert(packet.end(), pid.begin(), pid.end());
-    // UUID
-    auto uuid = encodeString(fakeUUID);
-    packet.insert(packet.end(), uuid.begin(), uuid.end());
-    // Username
+    // UUID (16 bytes, all zero for demo)
+    for (int i = 0; i < 16; ++i) packet.push_back(0x00);
+    // Username (as Minecraft string)
     auto uname = encodeString(username);
     packet.insert(packet.end(), uname.begin(), uname.end());
     // Prepend length
     auto plen = encodeVarInt((int)packet.size());
     packet.insert(packet.begin(), plen.begin(), plen.end());
+    // Debug: print raw bytes
+    std::cout << "[Protocol] Login Success packet bytes: ";
+    for (size_t i = 0; i < packet.size(); ++i) {
+        printf("%02X ", packet[i]);
+    }
+    std::cout << std::endl;
     // Send
     send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+    Sleep(10); // Small delay to prevent packet coalescing
     std::cout << "[Protocol] Sent Login Success to " << username << std::endl;
 #endif
 }
@@ -392,6 +441,7 @@ void PacketHandler::sendLoginFinished(void* socketPtr) {
     }
     std::cout << std::endl;
     send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+    Sleep(10); // Small delay to prevent packet coalescing
     std::cout << "[Protocol] Sent Login Finished" << std::endl;
 #endif
 }
