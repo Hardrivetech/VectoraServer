@@ -58,13 +58,24 @@ void NetworkServer::start() {
     auto clientHandler = [](SOCKET clientSocket) {
         std::cout << "[Network] Client connected!" << std::endl;
         PacketHandler handler;
-        uint8_t buffer[1024];
-        int bytesReceived = recv(clientSocket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
-        if (bytesReceived > 0) {
-            std::vector<uint8_t> data(buffer, buffer + bytesReceived);
-            handler.handle(data, &clientSocket);
-        } else {
-            std::cout << "[Network] No data received or connection closed." << std::endl;
+        uint8_t buffer[4096];
+        std::vector<uint8_t> packetBuffer;
+        while (true) {
+            int bytesReceived = recv(clientSocket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
+            if (bytesReceived > 0) {
+                packetBuffer.insert(packetBuffer.end(), buffer, buffer + bytesReceived);
+                // Try to process as many packets as possible from the buffer
+                while (!packetBuffer.empty()) {
+                    // Pass the entire buffer to handler; handler should process one packet and return
+                    size_t before = packetBuffer.size();
+                    handler.handle(packetBuffer, &clientSocket);
+                    // If handler did not consume any bytes, break to avoid infinite loop
+                    if (packetBuffer.size() == before) break;
+                }
+            } else {
+                std::cout << "[Network] No data received or connection closed." << std::endl;
+                break;
+            }
         }
         closesocket(clientSocket);
     };

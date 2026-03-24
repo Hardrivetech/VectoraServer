@@ -1,10 +1,16 @@
+#include <string>
 #include "protocol/PacketHandler.h"
 #include <iostream>
+#include "world/AnvilRegion.h"
+#include "world/ChunkParser.h"
+#include "world/ChunkSerializer.h"
 
 
 void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr) {
     std::cout << "[Protocol] Handling packet of size " << data.size() << " bytes" << std::endl;
     if (data.empty()) return;
+    // Make a non-const copy so we can erase processed bytes
+    std::vector<uint8_t>& buffer = const_cast<std::vector<uint8_t>&>(data);
 
     size_t offset = 0;
     auto readVarInt = [&](int& out) -> bool {
@@ -44,14 +50,18 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr) {
         std::cout << "[Protocol] Failed to read packet ID (VarInt)" << std::endl;
         return;
     }
+    size_t packet_start = 0;
     std::cout << "[Protocol] Packet ID: 0x" << std::hex << packetId << std::dec << std::endl;
+    if (packetId != 0x00) {
+        std::cout << "[Protocol] Received non-handshake packet ID: 0x" << std::hex << packetId << std::dec << std::endl;
+    }
 
     if (packetId == 0x00) {
         // Handshake or login start
         if (offset < data.size()) {
             // Try to read as handshake (protocol version is VarInt, server address is String, port is UShort, next state is VarInt)
             int protocolVersion = 0;
-            size_t saveOffset = offset;
+            size_t save_offset = offset;
             if (readVarInt(protocolVersion)) {
                 std::string serverAddress;
                 if (readString(serverAddress)) {
@@ -63,21 +73,64 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr) {
                                   << ", serverPort=" << serverPort
                                   << ", nextState=" << nextState << std::endl;
                         // TODO: Store state for login/status
+                        // Erase processed bytes (handshake packet)
+                        buffer.erase(buffer.begin(), buffer.begin() + offset);
                         return;
                     }
                 }
             }
             // If not handshake, reset offset and try login start
-            offset = saveOffset;
+            offset = save_offset;
             std::string username;
             if (readString(username)) {
                 std::cout << "[Protocol] Login Start: username=" << username << std::endl;
-                sendLoginSuccess(username, socketPtr);
-                sendJoinGame(username, socketPtr);
-                sendPlayerPositionAndLook(socketPtr);
+                // Proceed to Play state: send Login Success, Join Game, Player Position, and Chunk Data
+
+                this->sendLoginSuccess(username, socketPtr);
+                this->sendLoginFinished(socketPtr);
+                this->sendJoinGame(username, socketPtr);
+                this->sendPlayerPositionAndLook(socketPtr);
+
+
+                // --- Chunk sending logic ---
+                // Load region and chunk (hardcoded to 0,0 for demo)
+                std::string regionPath = "world/region/r.0.0.mca";
+                AnvilRegion region(regionPath);
+                if (region.isValid()) {
+                    auto chunkData = region.loadChunk(0, 0);
+                    if (chunkData) {
+                        auto chunk = parseChunk(chunkData);
+                        if (chunk) {
+                            auto chunkPacket = serializeChunkData(chunk);
+                            // Prepend Chunk Data packet ID (0x22 for 1.21.11)
+                            auto pid = encodeVarInt(0x22);
+                            chunkPacket.insert(chunkPacket.begin(), pid.begin(), pid.end());
+                            // Prepend length
+                            auto plen = encodeVarInt((int)chunkPacket.size());
+                            chunkPacket.insert(chunkPacket.begin(), plen.begin(), plen.end());
+                            SOCKET sock = *(SOCKET*)socketPtr;
+                            send(sock, reinterpret_cast<const char*>(chunkPacket.data()), (int)chunkPacket.size(), 0);
+                            std::cout << "[Protocol] Sent Chunk Data (0,0)" << std::endl;
+                        } else {
+                            std::cout << "[Protocol] Failed to parse chunk (0,0)" << std::endl;
+                        }
+                    } else {
+                        std::cout << "[Protocol] Failed to load chunk data (0,0)" << std::endl;
+                    }
+                } else {
+                    std::cout << "[Protocol] Region file not valid: " << regionPath << std::endl;
+                }
+                // Erase processed bytes (login start packet)
+                buffer.erase(buffer.begin(), buffer.begin() + offset);
                 return;
+            } else {
+                std::cout << "[Protocol] Did not parse Login Start after handshake. Data left: " << (data.size() - offset) << " bytes." << std::endl;
             }
+            // Erase processed bytes (failed login start attempt)
+            buffer.erase(buffer.begin(), buffer.begin() + offset);
+            return;
         }
+
     } else if (packetId == 0x21) { // Keep Alive (clientbound is 0x21, serverbound is 0x0F in 1.19+)
         // Try to read keep-alive ID (long)
         if (offset + 8 <= data.size()) {
@@ -87,10 +140,45 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr) {
             }
             std::cout << "[Protocol] Received Keep Alive, echoing back ID: " << keepAliveId << std::endl;
             sendKeepAliveResponse(keepAliveId, socketPtr);
+            // Erase processed bytes (keep alive)
+            buffer.erase(buffer.begin(), buffer.begin() + offset);
             return;
         }
     }
     std::cout << "[Protocol] Unhandled packet ID: 0x" << std::hex << packetId << std::dec << std::endl;
+    // Erase processed bytes (unhandled packet)
+    buffer.erase(buffer.begin(), buffer.begin() + offset);
+}
+
+void PacketHandler::sendDisconnect(const std::string& message, void* socketPtr) {
+#ifdef _WIN32
+    if (!socketPtr) return;
+    SOCKET sock = *(SOCKET*)socketPtr;
+    // Disconnect packet (Login state: 0x00)
+    std::vector<uint8_t> packet;
+    std::vector<uint8_t> pid = encodeVarInt(0x00); // Packet ID for Disconnect (login)
+    packet.insert(packet.end(), pid.begin(), pid.end());
+    // Reason (chat, as JSON string)
+    std::string safeMsg = message;
+    if (safeMsg.empty()) safeMsg = "{\"text\":\"Disconnected by server\"}";
+    std::vector<uint8_t> reason = encodeString(safeMsg);
+    packet.insert(packet.end(), reason.begin(), reason.end());
+    // Prepend length
+    std::vector<uint8_t> plen = encodeVarInt((int)packet.size());
+    packet.insert(packet.begin(), plen.begin(), plen.end());
+    // Send
+    // Log raw packet bytes for debugging
+    std::cout << "[Protocol] Disconnect packet bytes: ";
+    for (size_t i = 0; i < packet.size(); ++i) {
+        printf("%02X ", packet[i]);
+    }
+    std::cout << std::endl;
+    int sent = send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+    std::cout << "[Protocol] Sent Disconnect message: " << safeMsg << " (" << sent << " bytes)" << std::endl;
+    // Wait longer to ensure packet is sent before closing
+    Sleep(500);
+    closesocket(sock);
+#endif
 }
 
 void PacketHandler::sendPlayerPositionAndLook(void* socketPtr) {
@@ -118,6 +206,12 @@ void PacketHandler::sendPlayerPositionAndLook(void* socketPtr) {
     packet.insert(packet.begin(), plen.begin(), plen.end());
     send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
     std::cout << "[Protocol] Sent Player Position and Look" << std::endl;
+    // Debug: print raw bytes
+    std::cout << "[Protocol] Player Position and Look packet bytes: ";
+    for (size_t i = 0; i < packet.size(); ++i) {
+        printf("%02X ", packet[i]);
+    }
+    std::cout << std::endl;
 #endif
 }
 
@@ -152,9 +246,9 @@ void PacketHandler::sendJoinGame(const std::string& username, void* socketPtr) {
 #ifdef _WIN32
     if (!socketPtr) return;
     SOCKET sock = *(SOCKET*)socketPtr;
-    // Join Game packet (0x26 for 1.19+, may need update for 1.21.11)
+    // Join Game packet (0x2D for 1.21.11)
     std::vector<uint8_t> packet;
-    auto pid = encodeVarInt(0x26); // Packet ID for Join Game
+    auto pid = encodeVarInt(0x2D); // Packet ID for Join Game (1.21.11)
     packet.insert(packet.end(), pid.begin(), pid.end());
     // Entity ID (int)
     auto eid = encodeVarInt(1); // Always 1 for demo
@@ -171,9 +265,21 @@ void PacketHandler::sendJoinGame(const std::string& username, void* socketPtr) {
     // World name (String)
     auto wname = encodeString("minecraft:overworld");
     packet.insert(packet.end(), wname.begin(), wname.end());
-    // Dimension codec (NBT, placeholder)
-    auto nbt = encodeString("");
-    packet.insert(packet.end(), nbt.begin(), nbt.end());
+    // Dimension codec (NBT, minimal valid payload for Overworld/Nether/End)
+    // This is a minimal NBT blob for the registry data. In production, use a real NBT encoder.
+    // For now, use a hardcoded minimal valid registry for Overworld only.
+    std::vector<uint8_t> minimalNbt = {
+        0x0A, 0x00, 0x00, // TAG_Compound("")
+        0x0A, 0x00, 0x08, 'd','i','m','e','n','s','i','o','n','s', // TAG_Compound("dimensions")
+        0x0A, 0x00, 0x09, 'm','i','n','e','c','r','a','f','t',':','o','v','e','r','w','o','r','l','d', // TAG_Compound("minecraft:overworld")
+        0x00, // TAG_End
+        0x00, // TAG_End
+        0x00  // TAG_End
+    };
+    // NBT is sent as a length-prefixed byte array (VarInt length)
+    auto nbtLen = encodeVarInt((int)minimalNbt.size());
+    packet.insert(packet.end(), nbtLen.begin(), nbtLen.end());
+    packet.insert(packet.end(), minimalNbt.begin(), minimalNbt.end());
     // Dimension (String)
     auto dim = encodeString("minecraft:overworld");
     packet.insert(packet.end(), dim.begin(), dim.end());
@@ -199,11 +305,20 @@ void PacketHandler::sendJoinGame(const std::string& username, void* socketPtr) {
     packet.push_back(0x00);
     // Is flat (bool)
     packet.push_back(0x00);
+    // Portal cooldown (VarInt, new in 1.20.2+)
+    auto portalCooldown = encodeVarInt(0);
+    packet.insert(packet.end(), portalCooldown.begin(), portalCooldown.end());
     // Prepend length
     auto plen = encodeVarInt((int)packet.size());
     packet.insert(packet.begin(), plen.begin(), plen.end());
     // Send
     send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+    // Debug: print raw bytes
+    std::cout << "[Protocol] Join Game packet bytes: ";
+    for (size_t i = 0; i < packet.size(); ++i) {
+        printf("%02X ", packet[i]);
+    }
+    std::cout << std::endl;
     std::cout << "[Protocol] Sent Join Game to " << username << std::endl;
 #endif
 }
@@ -257,4 +372,26 @@ std::vector<uint8_t> PacketHandler::encodeString(const std::string& str) {
     std::vector<uint8_t> out = encodeVarInt((int)str.size());
     out.insert(out.end(), str.begin(), str.end());
     return out;
+}
+
+void PacketHandler::sendLoginFinished(void* socketPtr) {
+#ifdef _WIN32
+    if (!socketPtr) return;
+    SOCKET sock = *(SOCKET*)socketPtr;
+    // Login Finished packet: 0x2A (packet id) for 1.21+
+    std::vector<uint8_t> packet;
+    auto pid = encodeVarInt(0x2A); // Update if protocol version changes
+    packet.insert(packet.end(), pid.begin(), pid.end());
+    // Prepend length (should be the size of the packet id only)
+    auto plen = encodeVarInt((int)packet.size());
+    packet.insert(packet.begin(), plen.begin(), plen.end());
+    // Debug: print raw bytes
+    std::cout << "[Protocol] Login Finished packet bytes: ";
+    for (size_t i = 0; i < packet.size(); ++i) {
+        printf("%02X ", packet[i]);
+    }
+    std::cout << std::endl;
+    send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+    std::cout << "[Protocol] Sent Login Finished" << std::endl;
+#endif
 }
