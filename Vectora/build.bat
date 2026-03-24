@@ -12,5 +12,8 @@ REM Run CMake and build
 cmake ..\Vectora
 cmake --build .
 
+REM Copy world folder
+xcopy ..\Vectora\world\* .\Debug\world\ /E /I /Y
+
 cd ..
 echo Build complete. To run: build\Vectora.exe

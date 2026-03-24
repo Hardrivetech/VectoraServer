@@ -9,6 +9,10 @@
 
 std::shared_ptr<Chunk> parseChunk(const std::shared_ptr<ChunkData>& chunkData) {
     if (!chunkData) return nullptr;
+    if (chunkData->compressionType != 2) {
+        std::cerr << "[ChunkParser] Skipping chunk at " << chunkData->x << "," << chunkData->z << " due to unsupported compression type: " << (int)chunkData->compressionType << std::endl;
+        return nullptr;
+    }
     std::vector<uint8_t> decompressed;
     if (!decompressZlib(chunkData->rawData, decompressed)) {
         std::cerr << "[ChunkParser] Failed to decompress chunk at " << chunkData->x << "," << chunkData->z << std::endl;

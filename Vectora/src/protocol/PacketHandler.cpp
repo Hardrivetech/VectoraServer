@@ -121,31 +121,33 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, Cl
             this->sendJoinGame(username, socketPtr);
             this->sendPlayerPositionAndLook(socketPtr);
             // --- Chunk sending logic ---
-            std::string regionPath = "world/region/r.0.0.mca";
-            AnvilRegion region(regionPath);
-            if (region.isValid()) {
-                auto chunkData = region.loadChunk(0, 0);
-                if (chunkData) {
-                    auto chunk = parseChunk(chunkData);
-                    if (chunk) {
-                        auto chunkPacket = serializeChunkData(chunk);
-                        auto pid = encodeVarInt(0x22);
-                        chunkPacket.insert(chunkPacket.begin(), pid.begin(), pid.end());
-                        auto plen = encodeVarInt((int)chunkPacket.size());
-                        chunkPacket.insert(chunkPacket.begin(), plen.begin(), plen.end());
-                        SOCKET sock = *(SOCKET*)socketPtr;
-                        send(sock, reinterpret_cast<const char*>(chunkPacket.data()), (int)chunkPacket.size(), 0);
-                        std::cout << "[Protocol] Sent Chunk Data (0,0)" << std::endl;
-                    } else {
-                        std::cout << "[Protocol] Failed to parse chunk (0,0)" << std::endl;
-                    }
+            // Parse chunk request packet (0x22): [int32 chunkX][int32 chunkZ]
+            if (buffer.size() < offset + 8) {
+                std::cout << "[Protocol] Chunk request packet too short" << std::endl;
+                return;
+            }
+            int32_t cx = (buffer[offset + 0] << 24) | (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3];
+            int32_t cz = (buffer[offset + 4] << 24) | (buffer[offset + 5] << 16) | (buffer[offset + 6] << 8) | buffer[offset + 7];
+            World world;
+            auto chunkData = world.loadChunk(cx, cz);
+            if (chunkData) {
+                auto chunk = parseChunk(chunkData);
+                if (chunk) {
+                    auto chunkPacket = serializeChunkData(chunk);
+                    auto pid = encodeVarInt(0x22);
+                    chunkPacket.insert(chunkPacket.begin(), pid.begin(), pid.end());
+                    auto plen = encodeVarInt((int)chunkPacket.size());
+                    chunkPacket.insert(chunkPacket.begin(), plen.begin(), plen.end());
+                    SOCKET sock = *(SOCKET*)socketPtr;
+                    send(sock, reinterpret_cast<const char*>(chunkPacket.data()), (int)chunkPacket.size(), 0);
+                    std::cout << "[Protocol] Sent Chunk Data (" << cx << "," << cz << ")" << std::endl;
                 } else {
-                    std::cout << "[Protocol] Failed to load chunk data (0,0)" << std::endl;
+                    std::cout << "[Protocol] Failed to parse chunk (" << cx << "," << cz << ")" << std::endl;
                 }
             } else {
-                std::cout << "[Protocol] Region file not valid: " << regionPath << std::endl;
+                std::cout << "[Protocol] Failed to load chunk data (" << cx << "," << cz << ")" << std::endl;
             }
-            buffer.erase(buffer.begin(), buffer.begin() + offset);
+            buffer.erase(buffer.begin(), buffer.begin() + offset + 8);
             return;
         } else {
             std::cout << "[Protocol] Did not parse Login Start after handshake. Data left: " << (data.size() - offset) << " bytes." << std::endl;
@@ -183,11 +185,21 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, Cl
             std::cout << "[Protocol] Malformed Keep Alive (serverbound) packet, expected 8 bytes for ID." << std::endl;
         }
     }
-    std::cout << "[Protocol] Unhandled packet ID: 0x" << std::hex << packetId << std::dec << ", raw bytes: ";
+    // Improved error handling for unknown packets
+    SOCKET sock = socketPtr ? *(SOCKET*)socketPtr : 0;
+    std::cout << "[Protocol] Unhandled packet ID: 0x" << std::hex << packetId << std::dec
+              << ", size: " << data.size() << ", offset: " << offset
+              << ", statusState: " << (clientState ? clientState->statusState : -1)
+              << ", raw bytes: ";
     for (size_t i = 0; i < data.size(); ++i) {
         printf("%02X ", data[i]);
     }
     std::cout << std::endl;
+    // Optionally, disconnect on critical unknowns (example: unknown in login/play)
+    // if (packetId > 0xFF && !clientState->statusState) {
+    //     sendDisconnect("Unknown or unsupported packet received.", socketPtr);
+    //     return;
+    // }
     // Erase processed bytes (unhandled packet)
     buffer.erase(buffer.begin(), buffer.begin() + offset);
 }
