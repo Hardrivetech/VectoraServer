@@ -236,6 +236,7 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, Cl
         buffer.erase(buffer.begin(), buffer.begin() + offset);
         return;
     }
+            // ...existing code...
             // Send a chat message to the client (clientbound 0x0F for 1.19+)
             void PacketHandler::sendChatMessage(const std::string& jsonMsg, void* socketPtr) {
             #ifdef _WIN32
