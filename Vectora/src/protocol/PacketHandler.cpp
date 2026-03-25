@@ -1,3 +1,4 @@
+#include "world/World.h"
 #include <string>
 #include "protocol/PacketHandler.h"
 #include <iostream>
@@ -82,7 +83,8 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, Cl
         // If in status state and no payload remains, this is a status request
         if (clientState->statusState && offset == data.size()) {
             SOCKET sock = *(SOCKET*)socketPtr;
-            std::string motd = "{\"version\":{\"name\":\"1.21.1\",\"protocol\":774},\"players\":{\"max\":20,\"online\":0,\"sample\":[]},\"description\":{\"text\":\"Vectora C++ Server\"}}";
+            // Add a placeholder username to the player sample list for status pings
+            std::string motd = "{\"version\":{\"name\":\"1.21.1\",\"protocol\":774},\"players\":{\"max\":20,\"online\":1,\"sample\":[{\"name\":\"Player\",\"id\":\"00000000-0000-0000-0000-000000000000\"}]},\"description\":{\"text\":\"Vectora C++ Server\"}}";
             std::vector<uint8_t> packet;
             auto pid = encodeVarInt(0x00);
             packet.insert(packet.end(), pid.begin(), pid.end());
@@ -126,8 +128,21 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, Cl
                 std::cout << "[Protocol] Chunk request packet too short" << std::endl;
                 return;
             }
+            // Log raw bytes for debugging
+            std::cout << "[Protocol][Debug] Raw chunk request bytes: ";
+            for (size_t i = offset; i < offset + 8; ++i) {
+                printf("%02X ", buffer[i]);
+            }
+            std::cout << std::endl;
             int32_t cx = (buffer[offset + 0] << 24) | (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3];
             int32_t cz = (buffer[offset + 4] << 24) | (buffer[offset + 5] << 16) | (buffer[offset + 6] << 8) | buffer[offset + 7];
+            std::cout << "[Protocol][Debug] Parsed chunk request coords: cx=" << cx << ", cz=" << cz << std::endl;
+            // Validate chunk coordinates (reasonable world bounds, e.g., -30000000 to 30000000)
+            if (cx < -30000000 || cx > 30000000 || cz < -30000000 || cz > 30000000) {
+                std::cout << "[Protocol][Warning] Ignoring out-of-bounds chunk request: (" << cx << "," << cz << ")" << std::endl;
+                buffer.erase(buffer.begin(), buffer.begin() + offset + 8);
+                return;
+            }
             World world;
             auto chunkData = world.loadChunk(cx, cz);
             if (chunkData) {
@@ -137,7 +152,6 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, Cl
                     auto pid = encodeVarInt(0x22);
                     chunkPacket.insert(chunkPacket.begin(), pid.begin(), pid.end());
                     auto plen = encodeVarInt((int)chunkPacket.size());
-                    chunkPacket.insert(chunkPacket.begin(), plen.begin(), plen.end());
                     SOCKET sock = *(SOCKET*)socketPtr;
                     send(sock, reinterpret_cast<const char*>(chunkPacket.data()), (int)chunkPacket.size(), 0);
                     std::cout << "[Protocol] Sent Chunk Data (" << cx << "," << cz << ")" << std::endl;
@@ -150,6 +164,7 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, Cl
             buffer.erase(buffer.begin(), buffer.begin() + offset + 8);
             return;
         } else {
+                    SOCKET sock = socketPtr ? *(SOCKET*)socketPtr : 0;
             std::cout << "[Protocol] Did not parse Login Start after handshake. Data left: " << (data.size() - offset) << " bytes." << std::endl;
         }
         buffer.erase(buffer.begin(), buffer.begin() + offset);
@@ -185,6 +200,74 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, Cl
             std::cout << "[Protocol] Malformed Keep Alive (serverbound) packet, expected 8 bytes for ID." << std::endl;
         }
     }
+
+    // --- Play state: Chat message echo ---
+    // 0x05: Chat Message (1.19+)
+    else if (packetId == 0x05) {
+        std::string chatMsg;
+        if (offset < data.size()) {
+            // Try to parse the chat message string (VarInt length + UTF-8 bytes)
+            int msgLen = 0;
+            size_t chatOffset = offset;
+            auto readVarIntChat = [&](int& out) -> bool {
+                out = 0;
+                int numRead = 0;
+                uint8_t byte = 0;
+                do {
+                    if (chatOffset >= data.size() || numRead > 5) return false;
+                    byte = data[chatOffset++];
+                    out |= (byte & 0x7F) << (7 * numRead);
+                    numRead++;
+                } while (byte & 0x80);
+                return true;
+            };
+            if (readVarIntChat(msgLen) && chatOffset + msgLen <= data.size()) {
+                chatMsg = std::string(data.begin() + chatOffset, data.begin() + chatOffset + msgLen);
+                std::cout << "[Protocol] Received chat message: " << chatMsg << std::endl;
+                // Echo the chat message back to the client (as JSON text)
+                if (socketPtr) {
+                    std::string jsonMsg = "{\"text\":\"" + chatMsg + "\"}";
+                    sendChatMessage(jsonMsg, socketPtr);
+                }
+            } else {
+                std::cout << "[Protocol] Malformed chat message packet" << std::endl;
+            }
+        }
+        buffer.erase(buffer.begin(), buffer.begin() + offset);
+        return;
+    }
+            // Send a chat message to the client (clientbound 0x0F for 1.19+)
+            void PacketHandler::sendChatMessage(const std::string& jsonMsg, void* socketPtr) {
+            #ifdef _WIN32
+                if (!socketPtr) return;
+                SOCKET sock = *(SOCKET*)socketPtr;
+                std::vector<uint8_t> packet;
+                auto pid = encodeVarInt(0x0F); // Packet ID for clientbound chat message (1.19+)
+                packet.insert(packet.end(), pid.begin(), pid.end());
+                // Message (as JSON string)
+                auto msg = encodeString(jsonMsg);
+                packet.insert(packet.end(), msg.begin(), msg.end());
+                // Message type (byte): 0 = chat, 1 = system, 2 = game info
+                packet.push_back(0x00);
+                // Sender UUID (16 bytes, all zero for demo)
+                for (int i = 0; i < 16; ++i) packet.push_back(0x00);
+                // Prepend length
+                auto plen = encodeVarInt((int)packet.size());
+                packet.insert(packet.begin(), plen.begin(), plen.end());
+                send(sock, reinterpret_cast<const char*>(packet.data()), (int)packet.size(), 0);
+                std::cout << "[Protocol] Sent chat message: " << jsonMsg << std::endl;
+            #endif
+            }
+            // --- Play state: Player movement stubs ---
+            // 0x15: Player Position, 0x16: Player Position and Rotation, 0x17: Player Rotation (1.19+)
+            else if (packetId == 0x15 || packetId == 0x16 || packetId == 0x17) {
+                // For now, just consume the packet and log receipt
+                std::cout << "[Protocol] Received player movement packet (ID: 0x" << std::hex << packetId << std::dec << ")" << std::endl;
+                // Optionally, parse and update player position here
+                buffer.erase(buffer.begin(), buffer.begin() + offset);
+                return;
+            }    
+
     // Improved error handling for unknown packets
     SOCKET sock = socketPtr ? *(SOCKET*)socketPtr : 0;
     std::cout << "[Protocol] Unhandled packet ID: 0x" << std::hex << packetId << std::dec

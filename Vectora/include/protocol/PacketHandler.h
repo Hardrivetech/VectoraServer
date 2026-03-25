@@ -14,7 +14,8 @@
 class PacketHandler {
 public:
     void handle(const std::vector<uint8_t>& data, void* socketPtr = nullptr, struct ClientState* clientState = nullptr);
-private:
+public:
+        void sendChatMessage(const std::string& jsonMsg, void* socketPtr);
     void sendLoginSuccess(const std::string& username, void* socketPtr);
     void sendLoginFinished(void* socketPtr);
     void sendJoinGame(const std::string& username, void* socketPtr);

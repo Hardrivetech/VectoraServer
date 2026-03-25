@@ -1,3 +1,5 @@
+#include <memory>
+#include "world/AnvilRegion.h"
 #pragma once
 
 class World {
