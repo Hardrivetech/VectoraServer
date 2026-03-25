@@ -22,7 +22,7 @@ issues:
   - title: Implement inventory and entity interaction
     body: Add packet handlers for inventory actions and entity interactions in play state.
     labels: [feature, gameplay]
-    status: backlog
+    status: in progress
   - title: Server-to-client system messages
     body: Implement system message and chat broadcast to all connected clients.
     labels: [feature, chat]
@@ -38,7 +38,7 @@ issues:
   - title: Parse block/entity data in chunks
     body: Add parsed block and entity data to ChunkData structures. (See TODO in AnvilRegion.h)
     labels: [enhancement, world]
-    status: backlog
+    status: done
   - title: Add lighting and biome data
     body: Implement lighting and biome support in chunk/block section structures. (See TODO in Chunk.h)
     labels: [enhancement, world]

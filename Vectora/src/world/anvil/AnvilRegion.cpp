@@ -85,6 +85,10 @@ std::shared_ptr<ChunkData> AnvilRegion::loadChunk(int chunkX, int chunkZ) {
     chunk->z = chunkZ;
     chunk->compressionType = compressionType;
     chunk->rawData = std::move(rawData);
-    // TODO: Decompress and parse NBT
+    // Parse block/entity data if compression is supported
+    extern std::shared_ptr<Chunk> parseChunk(const std::shared_ptr<ChunkData>&);
+    if (compressionType == 2) {
+        chunk->parsedChunk = parseChunk(chunk);
+    }
     return chunk;
 }

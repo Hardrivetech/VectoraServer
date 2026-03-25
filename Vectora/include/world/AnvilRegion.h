@@ -4,11 +4,12 @@
 #include <cstdint>
 #include <memory>
 
+struct Chunk;
 struct ChunkData {
     int x, z;
     uint8_t compressionType = 0;
     std::vector<uint8_t> rawData;
-    // TODO: Add parsed block/entity data
+    std::shared_ptr<Chunk> parsedChunk; // Parsed block/entity data
 };
 
 class AnvilRegion {

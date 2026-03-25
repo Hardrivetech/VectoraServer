@@ -6,9 +6,19 @@
 #include <memory>
 #include <sstream>
 
+// For demonstration, maintain a simple list of loaded chunks
+#include <vector>
+static std::vector<std::shared_ptr<ChunkData>> loadedChunks;
+
 void World::tick() {
-    std::cout << "[World] Ticking world... (placeholder)" << std::endl;
-    // TODO: Implement world logic
+    std::cout << "[World] Ticking world..." << std::endl;
+    // Example: iterate over loaded chunks and print their coordinates
+    for (const auto& chunk : loadedChunks) {
+        if (chunk) {
+            std::cout << "[World] Chunk at x=" << chunk->x << ", z=" << chunk->z << std::endl;
+        }
+    }
+    // Future: update entities, process block updates, etc.
 }
 
 std::shared_ptr<ChunkData> World::loadChunk(int chunkX, int chunkZ) {

@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 set(CMAKE_TOOLCHAIN_FILE "C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
 
-set(APP_ICON_RESOURCE_WINDOWS "${CMAKE_CURRENT_SOURCE_DIR}/appicon.rc")
 
 project(Vectora)
 
@@ -18,6 +17,7 @@ add_executable(Vectora
     src/world/anvil/NBT.cpp
     src/world/anvil/ZlibUtil.cpp
     src/world/anvil/BlockStateParser.cpp
+    appicon.rc
 )
 
 include_directories(include)
