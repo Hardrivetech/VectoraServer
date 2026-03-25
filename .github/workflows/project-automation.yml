@@ -17,7 +17,7 @@ jobs:
         id: create_issues
         uses: peter-evans/create-issue-from-file@v5 # Use @v5 if available, else keep @v4
         with:
-          title: ${{ github.event.head_commit.message }}
+          title: ${{ github.event.head_commit.message || 'Automated Issue' }}
           content-filepath: .github/vectora-roadmap.yml
           token: ${{ secrets.GH_TOKEN }}
       - name: Add issues to GitHub Project (beta)
