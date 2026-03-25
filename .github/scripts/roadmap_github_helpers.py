@@ -1,4 +1,15 @@
 # Helper to get all issues in the repo (open and closed)
+import os
+import requests
+
+GITHUB_API = "https://api.github.com"
+REPO = os.environ.get("GITHUB_REPOSITORY")
+TOKEN = os.environ.get("GH_TOKEN")
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Accept": "application/vnd.github+json"
+}
+
 def get_existing_issue_titles():
     url = f"{GITHUB_API}/repos/{REPO}/issues?state=all&per_page=100"
     titles = set()
