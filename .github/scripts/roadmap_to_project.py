@@ -1,7 +1,9 @@
+
 import os
 import sys
 import yaml
 import requests
+from roadmap_github_helpers import get_existing_issue_titles
 
 GITHUB_API = "https://api.github.com"
 REPO = os.environ.get("GITHUB_REPOSITORY")
@@ -80,10 +82,14 @@ def set_status(item_id, status):
 def main():
     with open(ROADMAP_FILE, "r", encoding="utf-8") as f:
         roadmap = yaml.safe_load(f)
+    existing_titles = get_existing_issue_titles()
     for issue in roadmap.get("issues", []):
-        title = issue["title"]
+        title = issue["title"].strip()
         body = issue.get("body", "")
         labels = issue.get("labels", [])
+        if title in existing_titles:
+            print(f"Skipping existing issue: {title}")
+            continue
         print(f"Creating issue: {title}")
         issue_number, issue_node_id = create_issue(title, body, labels)
         print(f"  Created issue #{issue_number}")
