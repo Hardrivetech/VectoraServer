@@ -7,8 +7,8 @@ issues:
     body: Send chat to all connected players, not just echo.
     labels: [feature, chat]
     status: open
-  - title: Player state tracking
-    body: Store and update player positions, rotations, and world state.
+  - title: Player state tracking and movement
+    body: Store and update player positions, rotations, and world state. Implement player movement packet handling and update logic.
     labels: [feature, core]
     status: open
   - title: World interaction (block updates)
@@ -31,19 +31,23 @@ issues:
     body: Add support for entity creation, updates, and removal in the world.
     labels: [feature, world]
     status: open
-  - title: Implement world logic
-    body: Fill in world tick/update logic for simulation and events.
+  - title: Implement world logic (tick/update)
+    body: Fill in world tick/update logic for simulation and events. Replace placeholder with real simulation code.
     labels: [feature, core]
     status: open
   - title: Parse block/entity data in chunks
-    body: Add parsed block and entity data to ChunkData structures.
+    body: Add parsed block and entity data to ChunkData structures. (See TODO in AnvilRegion.h)
     labels: [enhancement, world]
-    status: completed
+    status: open
   - title: Add lighting and biome data
-    body: Implement lighting and biome support in chunk/block section structures.
+    body: Implement lighting and biome support in chunk/block section structures. (See TODO in Chunk.h)
     labels: [enhancement, world]
     status: completed
   - title: Decompress and parse NBT for chunks
-    body: Implement decompression and NBT parsing for chunk data loading.
+    body: Implement decompression and NBT parsing for chunk data loading. (See TODO in AnvilRegion.cpp)
     labels: [enhancement, world]
     status: completed
+  - title: Implement NBT encoder for dimension codec
+    body: Replace hardcoded minimal NBT registry with a real NBT encoder for dimension codec in protocol.
+    labels: [enhancement, protocol]
+    status: open

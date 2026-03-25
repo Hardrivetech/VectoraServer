@@ -261,12 +261,58 @@ void PacketHandler::handle(const std::vector<uint8_t>& data, void* socketPtr, Cl
             // --- Play state: Player movement stubs ---
             // 0x15: Player Position, 0x16: Player Position and Rotation, 0x17: Player Rotation (1.19+)
             else if (packetId == 0x15 || packetId == 0x16 || packetId == 0x17) {
-                // For now, just consume the packet and log receipt
+                // Player movement packets (see https://wiki.vg/Protocol#Play)
+                // 0x15: Player Position
+                // 0x16: Player Position and Rotation
+                // 0x17: Player Rotation
                 std::cout << "[Protocol] Received player movement packet (ID: 0x" << std::hex << packetId << std::dec << ")" << std::endl;
-                // Optionally, parse and update player position here
+                size_t startOffset = offset;
+                if (packetId == 0x15) { // Position only
+                    if (offset + 25 <= data.size()) {
+                        double x = 0, y = 0, z = 0;
+                        memcpy(&x, &data[offset], 8); offset += 8;
+                        memcpy(&y, &data[offset], 8); offset += 8;
+                        memcpy(&z, &data[offset], 8); offset += 8;
+                        bool onGround = data[offset++] != 0;
+                        clientState->x = x;
+                        clientState->y = y;
+                        clientState->z = z;
+                        clientState->onGround = onGround;
+                        std::cout << "[Protocol] Updated position: x=" << x << ", y=" << y << ", z=" << z << ", onGround=" << onGround << std::endl;
+                    }
+                } else if (packetId == 0x16) { // Position and Rotation
+                    if (offset + 33 <= data.size()) {
+                        double x = 0, y = 0, z = 0;
+                        float yaw = 0, pitch = 0;
+                        memcpy(&x, &data[offset], 8); offset += 8;
+                        memcpy(&y, &data[offset], 8); offset += 8;
+                        memcpy(&z, &data[offset], 8); offset += 8;
+                        memcpy(&yaw, &data[offset], 4); offset += 4;
+                        memcpy(&pitch, &data[offset], 4); offset += 4;
+                        bool onGround = data[offset++] != 0;
+                        clientState->x = x;
+                        clientState->y = y;
+                        clientState->z = z;
+                        clientState->yaw = yaw;
+                        clientState->pitch = pitch;
+                        clientState->onGround = onGround;
+                        std::cout << "[Protocol] Updated pos+rot: x=" << x << ", y=" << y << ", z=" << z << ", yaw=" << yaw << ", pitch=" << pitch << ", onGround=" << onGround << std::endl;
+                    }
+                } else if (packetId == 0x17) { // Rotation only
+                    if (offset + 9 <= data.size()) {
+                        float yaw = 0, pitch = 0;
+                        memcpy(&yaw, &data[offset], 4); offset += 4;
+                        memcpy(&pitch, &data[offset], 4); offset += 4;
+                        bool onGround = data[offset++] != 0;
+                        clientState->yaw = yaw;
+                        clientState->pitch = pitch;
+                        clientState->onGround = onGround;
+                        std::cout << "[Protocol] Updated rotation: yaw=" << yaw << ", pitch=" << pitch << ", onGround=" << onGround << std::endl;
+                    }
+                }
                 buffer.erase(buffer.begin(), buffer.begin() + offset);
                 return;
-            }    
+            }
 
     // Improved error handling for unknown packets
     SOCKET sock = socketPtr ? *(SOCKET*)socketPtr : 0;
