@@ -1,7 +1,3 @@
-# GitHub Project (beta) Automation Workflow
-# This workflow creates issues from a YAML roadmap file and adds them to a GitHub Projects (beta) board with status 'Backlog'.
-# You may freely distribute and modify this workflow.
-
 name: Project Automation
 
 on:
@@ -12,15 +8,17 @@ on:
 jobs:
   create-and-add-to-project:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Create issues from roadmap
         id: create_issues
-        uses: peter-evans/create-issue-from-file@v4
+        uses: peter-evans/create-issue-from-file@v5 # Use @v5 if available, else keep @v4
         with:
           title: ${{ github.event.head_commit.message }}
           content-filepath: .github/vectora-roadmap.yml
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GH_TOKEN }}
       - name: Add issues to GitHub Project (beta)
         if: steps.create_issues.outputs.issue-number
         env:
