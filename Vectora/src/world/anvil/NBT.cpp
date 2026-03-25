@@ -1,3 +1,110 @@
+#include <cstring>
+
+static void writeString(std::vector<uint8_t>& out, const std::string& str) {
+    uint16_t len = (uint16_t)str.size();
+    out.push_back((len >> 8) & 0xFF);
+    out.push_back(len & 0xFF);
+    out.insert(out.end(), str.begin(), str.end());
+}
+
+std::vector<uint8_t> NBT::encode() const {
+    std::vector<uint8_t> out;
+    out.push_back(static_cast<uint8_t>(type));
+    writeString(out, name);
+    switch (type) {
+        case NBTType::End:
+            break;
+        case NBTType::Byte:
+            out.push_back((uint8_t)intValue);
+            break;
+        case NBTType::Short:
+            out.push_back((intValue >> 8) & 0xFF);
+            out.push_back(intValue & 0xFF);
+            break;
+        case NBTType::Int:
+            out.push_back((intValue >> 24) & 0xFF);
+            out.push_back((intValue >> 16) & 0xFF);
+            out.push_back((intValue >> 8) & 0xFF);
+            out.push_back(intValue & 0xFF);
+            break;
+        case NBTType::Long:
+            for (int i = 7; i >= 0; --i) out.push_back((longValue >> (8 * i)) & 0xFF);
+            break;
+        case NBTType::Float: {
+            float f = (float)doubleValue;
+            uint8_t* p = reinterpret_cast<uint8_t*>(&f);
+            out.insert(out.end(), p, p + 4);
+            break;
+        }
+        case NBTType::Double: {
+            double d = doubleValue;
+            uint8_t* p = reinterpret_cast<uint8_t*>(&d);
+            out.insert(out.end(), p, p + 8);
+            break;
+        }
+        case NBTType::ByteArray: {
+            int32_t len = (int32_t)byteArray.size();
+            out.push_back((len >> 24) & 0xFF);
+            out.push_back((len >> 16) & 0xFF);
+            out.push_back((len >> 8) & 0xFF);
+            out.push_back(len & 0xFF);
+            out.insert(out.end(), byteArray.begin(), byteArray.end());
+            break;
+        }
+        case NBTType::String:
+            writeString(out, stringValue);
+            break;
+        case NBTType::List: {
+            out.push_back(list.empty() ? 0 : static_cast<uint8_t>(list[0]->type));
+            int32_t len = (int32_t)list.size();
+            out.push_back((len >> 24) & 0xFF);
+            out.push_back((len >> 16) & 0xFF);
+            out.push_back((len >> 8) & 0xFF);
+            out.push_back(len & 0xFF);
+            for (const auto& elem : list) {
+                auto enc = elem->encode();
+                out.insert(out.end(), enc.begin(), enc.end());
+            }
+            break;
+        }
+        case NBTType::Compound: {
+            for (const auto& kv : children) {
+                auto enc = kv.second->encode();
+                out.insert(out.end(), enc.begin(), enc.end());
+            }
+            out.push_back(0); // TAG_End
+            break;
+        }
+        case NBTType::IntArray: {
+            int32_t len = (int32_t)intArray.size();
+            out.push_back((len >> 24) & 0xFF);
+            out.push_back((len >> 16) & 0xFF);
+            out.push_back((len >> 8) & 0xFF);
+            out.push_back(len & 0xFF);
+            for (int32_t v : intArray) {
+                out.push_back((v >> 24) & 0xFF);
+                out.push_back((v >> 16) & 0xFF);
+                out.push_back((v >> 8) & 0xFF);
+                out.push_back(v & 0xFF);
+            }
+            break;
+        }
+        case NBTType::LongArray: {
+            int32_t len = (int32_t)longArray.size();
+            out.push_back((len >> 24) & 0xFF);
+            out.push_back((len >> 16) & 0xFF);
+            out.push_back((len >> 8) & 0xFF);
+            out.push_back(len & 0xFF);
+            for (int64_t v : longArray) {
+                for (int i = 7; i >= 0; --i) out.push_back((v >> (8 * i)) & 0xFF);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    return out;
+}
 #include "world/NBT.h"
 #include <cstring>
 

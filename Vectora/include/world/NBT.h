@@ -22,6 +22,7 @@ enum class NBTType : uint8_t {
     LongArray = 12
 };
 
+
 struct NBT {
     NBTType type;
     std::string name;
@@ -36,6 +37,9 @@ struct NBT {
     std::vector<uint8_t> byteArray;
     std::vector<int32_t> intArray;
     std::vector<int64_t> longArray;
+
+    // Encode this NBT tag (and children) to a byte array
+    std::vector<uint8_t> encode() const;
 };
 
 std::shared_ptr<NBT> parseNBT(const std::vector<uint8_t>& data, size_t& offset);

@@ -450,20 +450,24 @@ void PacketHandler::sendJoinGame(const std::string& username, void* socketPtr) {
     auto wname = encodeString("minecraft:overworld");
     packet.insert(packet.end(), wname.begin(), wname.end());
     // Dimension codec (NBT, minimal valid payload for Overworld/Nether/End)
-    // This is a minimal NBT blob for the registry data. In production, use a real NBT encoder.
-    // For now, use a hardcoded minimal valid registry for Overworld only.
-    std::vector<uint8_t> minimalNbt = {
-        0x0A, 0x00, 0x00, // TAG_Compound("")
-        0x0A, 0x00, 0x08, 'd','i','m','e','n','s','i','o','n','s', // TAG_Compound("dimensions")
-        0x0A, 0x00, 0x09, 'm','i','n','e','c','r','a','f','t',':','o','v','e','r','w','o','r','l','d', // TAG_Compound("minecraft:overworld")
-        0x00, // TAG_End
-        0x00, // TAG_End
-        0x00  // TAG_End
-    };
-    // NBT is sent as a length-prefixed byte array (VarInt length)
-    auto nbtLen = encodeVarInt((int)minimalNbt.size());
+    // Now using real NBT encoder
+    auto root = std::make_shared<NBT>();
+    root->type = NBTType::Compound;
+    root->name = "";
+    auto dimensions = std::make_shared<NBT>();
+    dimensions->type = NBTType::Compound;
+    dimensions->name = "dimensions";
+    auto overworld = std::make_shared<NBT>();
+    overworld->type = NBTType::Compound;
+    overworld->name = "minecraft:overworld";
+    // Add overworld to dimensions
+    dimensions->children[overworld->name] = overworld;
+    // Add dimensions to root
+    root->children[dimensions->name] = dimensions;
+    std::vector<uint8_t> nbtData = root->encode();
+    auto nbtLen = encodeVarInt((int)nbtData.size());
     packet.insert(packet.end(), nbtLen.begin(), nbtLen.end());
-    packet.insert(packet.end(), minimalNbt.begin(), minimalNbt.end());
+    packet.insert(packet.end(), nbtData.begin(), nbtData.end());
     // Dimension (String)
     auto dim = encodeString("minecraft:overworld");
     packet.insert(packet.end(), dim.begin(), dim.end());
