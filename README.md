@@ -1,12 +1,10 @@
 
 # Vectora
 
-This project is licensed under the [MIT License](LICENSE).
+Vectora is a high-performance custom Minecraft Java Edition 1.21.11 server written in modern C++20.
 
 **Project Roadmap:**
 Track features, progress, and ideas on the [Vectora Roadmap Project Board](https://github.com/users/Hardrivetech/projects/3).
-
-Vectora is a high-performance custom Minecraft Java Edition 1.21.11 server written in modern C++20.
 
 ## Current Status
 
@@ -89,3 +87,9 @@ Vectora is a high-performance custom Minecraft Java Edition 1.21.11 server writt
 - Track and update player state (positions, world interaction)
 - Add basic world interaction (block updates, entity handling)
 - Expand protocol support for more Minecraft features
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+
