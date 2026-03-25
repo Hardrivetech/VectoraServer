@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/vectora-roadmap.yml'
+  workflow_dispatch:
 
 jobs:
   create-and-add-to-project:
