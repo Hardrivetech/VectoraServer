@@ -9,6 +9,9 @@ TOKEN = os.environ.get("GH_TOKEN")
 PROJECT_ID = os.environ.get("PROJECT_ID")
 STATUS_FIELD_ID = os.environ.get("STATUS_FIELD_ID")
 BACKLOG_OPTION_ID = os.environ.get("BACKLOG_OPTION_ID")
+IN_PROGRESS_OPTION_ID = os.environ.get("IN_PROGRESS_OPTION_ID")
+REVIEW_OPTION_ID = os.environ.get("REVIEW_OPTION_ID")
+DONE_OPTION_ID = os.environ.get("DONE_OPTION_ID")
 ROADMAP_FILE = os.environ.get("ROADMAP_FILE", ".github/example-roadmap.yml")
 
 HEADERS = {
@@ -40,7 +43,7 @@ def add_to_project(issue_node_id):
     resp.raise_for_status()
     return resp.json()["data"]["addProjectV2ItemById"]["item"]["id"]
 
-def set_status(item_id):
+def set_status(item_id, status):
     query = """
     mutation($project:ID!, $item:ID!, $field:ID!, $option:String!) {
       updateProjectV2ItemFieldValue(input: {
@@ -53,11 +56,19 @@ def set_status(item_id):
       }
     }
     """
+    status_map = {
+        "backlog": BACKLOG_OPTION_ID,
+        "in progress": IN_PROGRESS_OPTION_ID,
+        "review": REVIEW_OPTION_ID,
+        "done": DONE_OPTION_ID
+    }
+    # Default to backlog if status is missing or unknown
+    option_id = status_map.get(str(status).strip().lower(), BACKLOG_OPTION_ID)
     variables = {
         "project": PROJECT_ID,
         "item": item_id,
         "field": STATUS_FIELD_ID,
-        "option": BACKLOG_OPTION_ID
+        "option": option_id
     }
     resp = requests.post(
         f"{GITHUB_API}/graphql",
@@ -78,8 +89,9 @@ def main():
         print(f"  Created issue #{issue_number}")
         item_id = add_to_project(issue_node_id)
         print(f"  Added to project as item {item_id}")
-        set_status(item_id)
-        print(f"  Status set to Backlog")
+        status = issue.get("status", "backlog")
+        set_status(item_id, status)
+        print(f"  Status set to {status.title()}")
 
 if __name__ == "__main__":
     main()
