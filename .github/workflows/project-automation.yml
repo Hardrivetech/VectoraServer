@@ -1,3 +1,7 @@
+# GitHub Project (beta) Automation Workflow
+# This workflow creates issues from a YAML roadmap file and adds them to a GitHub Projects (beta) board with status 'Backlog'.
+# You may freely distribute and modify this workflow.
+
 name: Project Automation
 
 on:
@@ -9,29 +13,21 @@ on:
 jobs:
   create-and-add-to-project:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
-      - name: Create issues from roadmap
-        id: create_issues
-        uses: peter-evans/create-issue-from-file@v5 # Use @v5 if available, else keep @v4
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          title: ${{ github.event.head_commit.message || 'Automated Issue' }}
-          content-filepath: .github/vectora-roadmap.yml
-          token: ${{ secrets.GH_TOKEN }}
-      - name: Add issues to GitHub Project (beta)
-        if: steps.create_issues.outputs.issue-number
+          python-version: '3.x'
+      - name: Install dependencies
+        run: pip install -r .github/scripts/requirements.txt
+      - name: Run roadmap automation script
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }} # Use a token with project write access
-          PROJECT_ID: PVT_kwHODWjCMs4BSuMK
-          STATUS_FIELD_ID: PVTSSF_lAHODWjCMs4BSuMKzhALEDw
-          BACKLOG_OPTION_ID: f75ad846
+          PROJECT_ID: ${{ secrets.PROJECT_ID }} # The ID of your GitHub Project (beta)
+          STATUS_FIELD_ID: ${{ secrets.STATUS_FIELD_ID }} # The ID of the 'Status' field in your project
+          BACKLOG_OPTION_ID: ${{ secrets.BACKLOG_OPTION_ID }} # The ID of the 'Backlog' option in your project
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ROADMAP_FILE: .github/vectora-roadmap.yml
         run: |
-          ISSUE_NUMBER=${{ steps.create_issues.outputs.issue-number }}
-          # Get the node ID for the issue
-          ISSUE_NODE_ID=$(gh api graphql -F number=$ISSUE_NUMBER -F owner=${{ github.repository_owner }} -F repo=${{ github.event.repository.name }} -f query='query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { issue(number: $number) { id } } }' --jq '.data.repository.issue.id')
-          # Add the issue to the project and get the item ID
-          ITEM_ID=$(gh api graphql -f query='mutation($project:ID!,$item:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$item}){item{id}}}' -f project=$PROJECT_ID -f item=$ISSUE_NODE_ID --jq '.data.addProjectV2ItemById.item.id')
-          # Set the status to Backlog
-          gh api graphql -f query='mutation($item:ID!,$field:ID!,$option: String!){updateProjectV2ItemFieldValue(input:{projectId:"'$PROJECT_ID'", itemId:$item, fieldId:$field, value:{singleSelectOptionId:$option}}){projectV2Item{id}}}' -f item=$ITEM_ID -f field=$STATUS_FIELD_ID -f option=$BACKLOG_OPTION_ID
+          python .github/scripts/roadmap_to_project.py
