@@ -6,7 +6,7 @@ issues:
   - title: Broadcast chat messages
     body: Send chat to all connected players, not just echo.
     labels: [feature, chat]
-    status: backlog
+    status: done
   - title: Player state tracking and movement
     body: Store and update player positions, rotations, and world state. Implement player movement packet handling and update logic.
     labels: [feature, core]
@@ -22,7 +22,7 @@ issues:
   - title: Implement inventory and entity interaction
     body: Add packet handlers for inventory actions and entity interactions in play state.
     labels: [feature, gameplay]
-    status: in progress
+    status: done
   - title: Server-to-client system messages
     body: Implement system message and chat broadcast to all connected clients.
     labels: [feature, chat]
