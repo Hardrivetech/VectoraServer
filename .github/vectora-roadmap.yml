@@ -2,15 +2,48 @@ issues:
   - title: Implement block breaking
     body: Add packet handler and world logic for block breaking.
     labels: [feature, gameplay]
+    status: open
   - title: Broadcast chat messages
     body: Send chat to all connected players, not just echo.
     labels: [feature, chat]
+    status: open
   - title: Player state tracking
     body: Store and update player positions, rotations, and world state.
     labels: [feature, core]
+    status: open
   - title: World interaction (block updates)
     body: Allow block breaking and placement by players.
     labels: [feature, world]
+    status: open
   - title: Protocol expansion
     body: Support more Minecraft protocol features and improve compatibility.
     labels: [enhancement, protocol]
+    status: completed
+  - title: Implement inventory and entity interaction
+    body: Add packet handlers for inventory actions and entity interactions in play state.
+    labels: [feature, gameplay]
+    status: open
+  - title: Server-to-client system messages
+    body: Implement system message and chat broadcast to all connected clients.
+    labels: [feature, chat]
+    status: open
+  - title: Basic entity handling
+    body: Add support for entity creation, updates, and removal in the world.
+    labels: [feature, world]
+    status: open
+  - title: Implement world logic
+    body: Fill in world tick/update logic for simulation and events.
+    labels: [feature, core]
+    status: open
+  - title: Parse block/entity data in chunks
+    body: Add parsed block and entity data to ChunkData structures.
+    labels: [enhancement, world]
+    status: completed
+  - title: Add lighting and biome data
+    body: Implement lighting and biome support in chunk/block section structures.
+    labels: [enhancement, world]
+    status: completed
+  - title: Decompress and parse NBT for chunks
+    body: Implement decompression and NBT parsing for chunk data loading.
+    labels: [enhancement, world]
+    status: completed
