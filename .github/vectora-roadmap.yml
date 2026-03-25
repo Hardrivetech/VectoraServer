@@ -30,7 +30,7 @@ issues:
   - title: Basic entity handling
     body: Add support for entity creation, updates, and removal in the world.
     labels: [feature, world]
-    status: backlog
+    status: done
   - title: Implement world logic (tick/update)
     body: Fill in world tick/update logic for simulation and events. Replace placeholder with real simulation code.
     labels: [feature, core]
