@@ -27,6 +27,9 @@ jobs:
           PROJECT_ID: ${{ secrets.PROJECT_ID }} # The ID of your GitHub Project (beta)
           STATUS_FIELD_ID: ${{ secrets.STATUS_FIELD_ID }} # The ID of the 'Status' field in your project
           BACKLOG_OPTION_ID: ${{ secrets.BACKLOG_OPTION_ID }} # The ID of the 'Backlog' option in your project
+          IN_PROGRESS_OPTION_ID: ${{ secrets.IN_PROGRESS_OPTION_ID }} # The ID of the 'In Progress' option in your project
+          REVIEW_OPTION_ID: ${{ secrets.REVIEW_OPTION_ID }} # The ID of the 'Review' option in your project
+          DONE_OPTION_ID: ${{ secrets.DONE_OPTION_ID }} # The ID of the 'Done' option in your project
           GITHUB_REPOSITORY: ${{ github.repository }}
           ROADMAP_FILE: .github/vectora-roadmap.yml
         run: |
