@@ -1,0 +1,15 @@
+- title: Implement block breaking
+  body: Add packet handler and world logic for block breaking.
+  labels: [feature, gameplay]
+- title: Broadcast chat messages
+  body: Send chat to all connected players, not just echo.
+  labels: [feature, chat]
+- title: Player state tracking
+  body: Store and update player positions, rotations, and world state.
+  labels: [feature, core]
+- title: World interaction (block updates)
+  body: Allow block breaking and placement by players.
+  labels: [feature, world]
+- title: Protocol expansion
+  body: Support more Minecraft protocol features and improve compatibility.
+  labels: [enhancement, protocol]
