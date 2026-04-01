@@ -19,6 +19,7 @@ add_executable(Vectora
 	src/core/identity/uuid_utils.c
 	src/config/packet/configuration_packets.c
 	src/config/replay/configuration_replay.c
+	src/config/runtime/server_config.c
 	src/world/storage/world_loader.c
 	src/play/packet/join_game.c
 	src/play/player/player_position.c
@@ -33,6 +34,7 @@ target_include_directories(Vectora PRIVATE
 	src/core/identity
 	src/config/packet
 	src/config/replay
+	src/config/runtime
 	src/world/storage
 	src/play/packet
 	src/play/player

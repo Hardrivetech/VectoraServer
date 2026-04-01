@@ -5,6 +5,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+static FILE *open_file_read_binary(const char *path) {
+#ifdef _WIN32
+    FILE *fp = NULL;
+    if (fopen_s(&fp, path, "rb") != 0) {
+        return NULL;
+    }
+    return fp;
+#else
+    return fopen(path, "rb");
+#endif
+}
+
 static void set_error(char *error, size_t error_size, const char *message, const char *path, size_t line_no) {
     if (error == NULL || error_size == 0) {
         return;
@@ -76,7 +88,7 @@ int load_config_replay_from_file(const char *path, config_replay_t *replay, char
     replay->lengths = NULL;
     replay->count = 0;
 
-    fp = fopen(path, "rb");
+    fp = open_file_read_binary(path);
     if (fp == NULL) {
         set_error(error, error_size, "could not open replay file", path, 0);
         return 0;

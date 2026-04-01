@@ -18,6 +18,18 @@ typedef struct {
     size_t pos;
 } nbt_reader_t;
 
+static FILE *open_file_read_binary(const char *path) {
+#ifdef _WIN32
+    FILE *fp = NULL;
+    if (fopen_s(&fp, path, "rb") != 0) {
+        return NULL;
+    }
+    return fp;
+#else
+    return fopen(path, "rb");
+#endif
+}
+
 static void set_error(char *error, size_t error_size, const char *message) {
     if (error == NULL || error_size == 0) {
         return;
@@ -43,7 +55,7 @@ static int read_file_all(const char *path, uint8_t **out_data, size_t *out_len) 
     *out_data = NULL;
     *out_len = 0;
 
-    fp = fopen(path, "rb");
+    fp = open_file_read_binary(path);
     if (fp == NULL) {
         return 0;
     }
@@ -393,7 +405,7 @@ static int world_path_exists(const char *world_path) {
     FILE *fp;
 
     snprintf(level_path, sizeof(level_path), "%s/level.dat", world_path);
-    fp = fopen(level_path, "rb");
+    fp = open_file_read_binary(level_path);
     if (fp == NULL) {
         return 0;
     }
@@ -526,6 +538,155 @@ static uint32_t read_be32_ptr(const uint8_t *src) {
            (uint32_t)src[3];
 }
 
+static uint64_t read_be64_ptr(const uint8_t *src) {
+    return ((uint64_t)src[0] << 56) |
+           ((uint64_t)src[1] << 48) |
+           ((uint64_t)src[2] << 40) |
+           ((uint64_t)src[3] << 32) |
+           ((uint64_t)src[4] << 24) |
+           ((uint64_t)src[5] << 16) |
+           ((uint64_t)src[6] << 8) |
+            (uint64_t)src[7];
+}
+
+int compute_safe_spawn_y_from_chunk_nbt(const uint8_t *chunk_nbt,
+                                        size_t chunk_nbt_len,
+                                        int32_t world_x,
+                                        int32_t world_z,
+                                        int32_t *out_spawn_y) {
+    nbt_reader_t reader;
+    const uint8_t *hm_ptr = NULL;
+    uint32_t hm_count = 0;
+    uint8_t root_type;
+    uint16_t root_name_len;
+    int local_x;
+    int local_z;
+    int column_index;
+    int bits_per_entry;
+    int entries_per_long;
+    int long_index;
+    int bit_index;
+    uint64_t mask;
+    uint64_t packed;
+    uint64_t hm_value;
+    int top_y;
+    const int min_world_y = -64;
+    const int max_world_y = 319;
+
+    if (chunk_nbt == NULL || chunk_nbt_len == 0 || out_spawn_y == NULL) {
+        return 0;
+    }
+
+    reader.data = chunk_nbt;
+    reader.len = chunk_nbt_len;
+    reader.pos = 0;
+
+    /* root TAG_Compound + root name */
+    if (!nbt_read_u8(&reader, &root_type) || root_type != 10) {
+        return 0;
+    }
+    if (!nbt_read_be16(&reader, &root_name_len) || !nbt_can_read(&reader, root_name_len)) {
+        return 0;
+    }
+    reader.pos += root_name_len;
+
+    /* Find root.Heightmaps.WORLD_SURFACE as TAG_Long_Array */
+    for (;;) {
+        uint8_t tag_type;
+        const uint8_t *name;
+        uint16_t name_len;
+
+        if (!nbt_read_u8(&reader, &tag_type)) {
+            return 0;
+        }
+        if (tag_type == 0) {
+            break;
+        }
+        if (!nbt_read_name(&reader, &name, &name_len)) {
+            return 0;
+        }
+
+        if (tag_type == 10 && nbt_name_equals(name, name_len, "Heightmaps")) {
+            for (;;) {
+                uint8_t ht;
+                const uint8_t *hn;
+                uint16_t hnl;
+                uint32_t cnt;
+
+                if (!nbt_read_u8(&reader, &ht)) {
+                    return 0;
+                }
+                if (ht == 0) {
+                    break;
+                }
+                if (!nbt_read_name(&reader, &hn, &hnl)) {
+                    return 0;
+                }
+
+                if (ht == 12 && nbt_name_equals(hn, hnl, "WORLD_SURFACE")) {
+                    if (!nbt_read_be32(&reader, &cnt)) {
+                        return 0;
+                    }
+                    if (!nbt_can_read(&reader, (size_t)cnt * 8u)) {
+                        return 0;
+                    }
+                    hm_ptr = reader.data + reader.pos;
+                    hm_count = cnt;
+                    reader.pos += (size_t)cnt * 8u;
+                } else {
+                    if (!nbt_skip_payload(&reader, ht)) {
+                        return 0;
+                    }
+                }
+            }
+        } else {
+            if (!nbt_skip_payload(&reader, tag_type)) {
+                return 0;
+            }
+        }
+    }
+
+    if (hm_ptr == NULL || hm_count == 0) {
+        return 0;
+    }
+
+    local_x = world_x & 15;
+    local_z = world_z & 15;
+    column_index = local_z * 16 + local_x; /* x increases fastest */
+
+    bits_per_entry = (int)((hm_count * 64u) / 256u);
+    if (bits_per_entry <= 0 || bits_per_entry >= 32) {
+        return 0;
+    }
+
+    entries_per_long = 64 / bits_per_entry;
+    if (entries_per_long <= 0) {
+        return 0;
+    }
+
+    long_index = column_index / entries_per_long;
+    bit_index = (column_index % entries_per_long) * bits_per_entry;
+    if ((uint32_t)long_index >= hm_count) {
+        return 0;
+    }
+
+    mask = (((uint64_t)1u << bits_per_entry) - 1u);
+    packed = read_be64_ptr(hm_ptr + (size_t)long_index * 8u);
+    hm_value = (packed >> bit_index) & mask;
+
+    /* Heightmap stores highest occupied y + 1 with min-world-y offset. */
+    top_y = min_world_y + (int)hm_value - 1;
+    if (top_y < min_world_y - 1) {
+        top_y = min_world_y - 1;
+    }
+    if (top_y > max_world_y) {
+        top_y = max_world_y;
+    }
+
+    *out_spawn_y = top_y + 1;
+    return 1;
+}
+
 int load_chunk_nbt_at(const world_info_t *info,
                       int32_t chunk_x,
                       int32_t chunk_z,
@@ -631,7 +792,7 @@ static int load_spawn_chunk(world_info_t *info) {
     return 1;
 }
 
-int load_world_info(world_info_t *info, char *error, size_t error_size) {
+int load_world_info(world_info_t *info, const char *preferred_world_path, char *error, size_t error_size) {
     char level_path[1024];
     uint8_t *compressed_level = NULL;
     size_t compressed_level_len = 0;
@@ -648,9 +809,17 @@ int load_world_info(world_info_t *info, char *error, size_t error_size) {
     info->spawn_y = 64;
     info->sea_level = 63;
 
-    if (!resolve_world_path(info)) {
-        set_error(error, error_size, "could not find a world folder");
-        return 0;
+    if (preferred_world_path != NULL && preferred_world_path[0] != '\0') {
+        if (!world_path_exists(preferred_world_path)) {
+            set_error(error, error_size, "configured world_path does not contain level.dat");
+            return 0;
+        }
+        snprintf(info->world_path, sizeof(info->world_path), "%s", preferred_world_path);
+    } else {
+        if (!resolve_world_path(info)) {
+            set_error(error, error_size, "could not find a world folder");
+            return 0;
+        }
     }
 
     snprintf(level_path, sizeof(level_path), "%s/level.dat", info->world_path);

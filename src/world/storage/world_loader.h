@@ -21,7 +21,7 @@ typedef struct {
     size_t spawn_chunk_nbt_len;
 } world_info_t;
 
-int load_world_info(world_info_t *info, char *error, size_t error_size);
+int load_world_info(world_info_t *info, const char *preferred_world_path, char *error, size_t error_size);
 void free_world_info(world_info_t *info);
 
 /*
@@ -34,5 +34,15 @@ int load_chunk_nbt_at(const world_info_t *info,
                       int32_t chunk_z,
                       uint8_t **out_chunk_nbt,
                       size_t *out_chunk_nbt_len);
+
+/*
+ * Compute a safe standing Y from a chunk NBT WORLD_SURFACE heightmap for the
+ * given world X/Z position. Returns 1 on success, 0 if unavailable.
+ */
+int compute_safe_spawn_y_from_chunk_nbt(const uint8_t *chunk_nbt,
+                                        size_t chunk_nbt_len,
+                                        int32_t world_x,
+                                        int32_t world_z,
+                                        int32_t *out_spawn_y);
 
 #endif
