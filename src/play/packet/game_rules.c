@@ -27,86 +27,77 @@ static size_t write_int_rule(uint8_t *outbuf, const char *rule_name, int32_t val
 }
 
 size_t build_game_rules_packet(uint8_t *outbuf, size_t outbuf_size, const game_rules_t *rules) {
-    uint8_t packet[4096];
-    size_t offset = 0;
+    uint8_t temp_rules[4000];
+    size_t temp_offset = 0;
     size_t rules_count = 0;
-    size_t count_offset = 0;
 
     (void)outbuf_size;
 
-    // Packet ID: 0x5D (Game Rules, clientbound)
-    offset += write_varint(packet + offset, 0x5D);
-
-    // Reserve space for rule count
-    count_offset = offset;
-    offset += write_varint(packet + offset, 0);
-
     if (rules != NULL) {
         // doDaylightCycle
-        offset += write_bool_rule(packet + offset, "doDaylightCycle", rules->do_daylight_cycle);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "doDaylightCycle", rules->do_daylight_cycle);
         rules_count++;
 
         // doMobSpawning
-        offset += write_bool_rule(packet + offset, "doMobSpawning", rules->do_mob_spawning);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "doMobSpawning", rules->do_mob_spawning);
         rules_count++;
 
         // doFireTick
-        offset += write_bool_rule(packet + offset, "doFireTick", rules->do_fire_tick);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "doFireTick", rules->do_fire_tick);
         rules_count++;
 
         // doEnvironmentDamage
-        offset += write_bool_rule(packet + offset, "doEnvironmentDamage", rules->do_environment_damage);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "doEnvironmentDamage", rules->do_environment_damage);
         rules_count++;
 
         // keepInventory
-        offset += write_bool_rule(packet + offset, "keepInventory", rules->keep_inventory);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "keepInventory", rules->keep_inventory);
         rules_count++;
 
         // doImmediateRespawn
-        offset += write_bool_rule(packet + offset, "doImmediateRespawn", rules->do_immediate_respawn);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "doImmediateRespawn", rules->do_immediate_respawn);
         rules_count++;
 
         // showDeathMessages
-        offset += write_bool_rule(packet + offset, "showDeathMessages", rules->show_death_messages);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "showDeathMessages", rules->show_death_messages);
         rules_count++;
 
         // sendCommandFeedback
-        offset += write_bool_rule(packet + offset, "sendCommandFeedback", rules->send_command_feedback);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "sendCommandFeedback", rules->send_command_feedback);
         rules_count++;
 
         // logAdminCommands
-        offset += write_bool_rule(packet + offset, "logAdminCommands", rules->log_admin_commands);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "logAdminCommands", rules->log_admin_commands);
         rules_count++;
 
         // announceAdvancements
-        offset += write_bool_rule(packet + offset, "announceAdvancements", rules->announce_advancements);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "announceAdvancements", rules->announce_advancements);
         rules_count++;
 
         // disableElytraMovementCheck
-        offset += write_bool_rule(packet + offset, "disableElytraMovementCheck", rules->disable_elytra_movement_check);
+        temp_offset += write_bool_rule(temp_rules + temp_offset, "disableElytraMovementCheck", rules->disable_elytra_movement_check);
         rules_count++;
 
         // maxCommandChainLength
-        offset += write_int_rule(packet + offset, "maxCommandChainLength", rules->max_command_chain_length);
+        temp_offset += write_int_rule(temp_rules + temp_offset, "maxCommandChainLength", rules->max_command_chain_length);
         rules_count++;
 
         // maxEntityCramming
-        offset += write_int_rule(packet + offset, "maxEntityCramming", rules->max_entity_cramming);
+        temp_offset += write_int_rule(temp_rules + temp_offset, "maxEntityCramming", rules->max_entity_cramming);
         rules_count++;
 
         // randomTickSpeed
-        offset += write_int_rule(packet + offset, "randomTickSpeed", rules->random_tick_speed);
+        temp_offset += write_int_rule(temp_rules + temp_offset, "randomTickSpeed", rules->random_tick_speed);
         rules_count++;
     }
 
-    // Go back and write the rule count
-    {
-        uint8_t count_buf[4];
-        size_t count_size = write_varint(count_buf, (int32_t)rules_count);
-        memcpy(packet + count_offset, count_buf, count_size);
-    }
+    // Now build the final packet with proper framing
+    size_t offset = 0;
+    offset += write_varint(outbuf + offset, 0x5D);  // Packet ID
+    offset += write_varint(outbuf + offset, (int32_t)rules_count);  // Rule count
+    memcpy(outbuf + offset, temp_rules, temp_offset);  // Rule data
+    offset += temp_offset;
 
-    memcpy(outbuf, packet, offset);
     return offset;
 }
 

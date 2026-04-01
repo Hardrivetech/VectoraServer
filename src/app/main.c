@@ -1266,14 +1266,6 @@ static void handle_client_connection(client_session_t *session) {
                                             printf("Sent server brand: %s.\n", server_config.server_brand);
                                         }
 
-                                        // Send Game Rules
-                                        {
-                                            uint8_t game_rules_buf[4096];
-                                            size_t game_rules_len = build_game_rules_packet(game_rules_buf, sizeof(game_rules_buf), &server_config.game_rules);
-                                            send_post_compression_packet(new_socket, game_rules_buf, game_rules_len);
-                                            printf("Sent Game Rules packet (%zu bytes).\n", game_rules_len);
-                                        }
-
                                         // Game Event type 13: "Start waiting for level chunks"
                                         // Required since 1.20.3 — without it the client never leaves "Loading terrain"
                                         if (server_config.send_wait_for_level_chunks_event) {
@@ -1471,6 +1463,14 @@ static void handle_client_connection(client_session_t *session) {
                                                 size_t time_len = build_update_time_packet(time_buf, sizeof(time_buf), 0, 1000, 1);
                                                 send_post_compression_packet(new_socket, time_buf, time_len);
                                                 printf("Sent Update Time.\n");
+                                            }
+
+                                            // Send Game Rules (after chunk operations) - TEMPORARILY DISABLED due to protocol issue
+                                            if (0) {
+                                                uint8_t game_rules_buf[4096];
+                                                size_t game_rules_len = build_game_rules_packet(game_rules_buf, sizeof(game_rules_buf), &server_config.game_rules);
+                                                send_post_compression_packet(new_socket, game_rules_buf, game_rules_len);
+                                                printf("Sent Game Rules packet (%zu bytes).\n", game_rules_len);
                                             }
 
                                             // Player Position and Look
