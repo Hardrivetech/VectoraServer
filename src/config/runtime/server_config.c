@@ -144,6 +144,9 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     if (strcmp(key, "max_players") == 0) {
         return parse_int_in_range(value, 1, 1000, &config->max_players);
     }
+    if (strcmp(key, "max_connections") == 0) {
+        return parse_int_in_range(value, 1, 10000, &config->max_connections);
+    }
     if (strcmp(key, "online_players_mode") == 0) {
         if (strcmp(value, "fixed") == 0) {
             config->online_players_mode = ONLINE_PLAYERS_MODE_FIXED;
@@ -176,6 +179,12 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     }
     if (strcmp(key, "simulation_distance") == 0) {
         return parse_int_in_range(value, 2, 32, &config->simulation_distance);
+    }
+    if (strcmp(key, "game_mode") == 0) {
+        return parse_int_in_range(value, 0, 3, &config->game_mode);
+    }
+    if (strcmp(key, "difficulty") == 0) {
+        return parse_int_in_range(value, 0, 3, &config->difficulty);
     }
     if (strcmp(key, "server_brand") == 0) {
         return parse_string_value(value, config->server_brand, sizeof(config->server_brand));
@@ -224,6 +233,10 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     }
     if (strcmp(key, "log_chunk_sends") == 0) {
         config->log_chunk_sends = parsed;
+        return 1;
+    }
+    if (strcmp(key, "offline_mode") == 0) {
+        config->offline_mode = parsed;
         return 1;
     }
 
@@ -285,6 +298,7 @@ void set_server_config_defaults(server_config_t *config) {
 
     config->port = 25565;
     config->max_players = 20;
+    config->max_connections = 100;
     config->online_players_mode = ONLINE_PLAYERS_MODE_FIXED;
     config->online_players_display = 0;
     config->protocol_number = 774;
@@ -292,6 +306,8 @@ void set_server_config_defaults(server_config_t *config) {
     config->chunk_stream_radius = 0;
     config->view_distance = 10;
     config->simulation_distance = 10;
+    config->game_mode = 0;
+    config->difficulty = 2;
     config->force_debug_spawn = 0;
     config->enable_real_chunks = 1;
     config->allow_debug_chunk_fallback = 1;
@@ -300,6 +316,7 @@ void set_server_config_defaults(server_config_t *config) {
     config->log_packet_framing = 1;
     config->log_play_packets = 0;
     config->log_chunk_sends = 1;
+    config->offline_mode = 1;
     snprintf(config->server_brand, sizeof(config->server_brand), "%s", "Vectora");
     snprintf(config->protocol_name, sizeof(config->protocol_name), "%s", "Vectora 1.20.x");
     snprintf(config->motd, sizeof(config->motd), "%s", "Welcome to Vectora!");

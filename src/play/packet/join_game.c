@@ -69,9 +69,10 @@ size_t build_join_game_packet_ex(uint8_t *outbuf, size_t outbuf_size, const join
     write_u64_be(packet + offset, params != NULL ? params->hashed_seed : 0);
     offset += 8;
 
-    // Game mode (ubyte), Previous game mode (byte)
+    // Game mode (ubyte), Previous game mode (byte), Difficulty (ubyte)
     packet[offset++] = params != NULL ? params->game_mode : 0x00;
     packet[offset++] = (uint8_t)(params != NULL ? params->previous_game_mode : -1);
+    packet[offset++] = params != NULL ? params->difficulty : 0x02;
 
     // Is Debug, Is Flat, Has Death Location
     packet[offset++] = params != NULL && params->is_debug ? 0x01 : 0x00;

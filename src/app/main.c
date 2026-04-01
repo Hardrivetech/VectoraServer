@@ -25,6 +25,7 @@ typedef SOCKET socket_handle_t;
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -44,6 +45,7 @@ static int g_log_chunk_sends = 1;
 
 #ifdef _WIN32
 static volatile LONG g_connected_play_sessions = 0;
+static volatile LONG g_active_connections = 0;
 static int load_connected_play_sessions(void) {
     return (int)InterlockedCompareExchange(&g_connected_play_sessions, 0, 0);
 }
@@ -53,8 +55,18 @@ static void increment_connected_play_sessions(void) {
 static void decrement_connected_play_sessions(void) {
     InterlockedDecrement(&g_connected_play_sessions);
 }
+static int load_active_connections(void) {
+    return (int)InterlockedCompareExchange(&g_active_connections, 0, 0);
+}
+static void increment_active_connections(void) {
+    InterlockedIncrement(&g_active_connections);
+}
+static void decrement_active_connections(void) {
+    InterlockedDecrement(&g_active_connections);
+}
 #else
 static volatile int g_connected_play_sessions = 0;
+static volatile int g_active_connections = 0;
 static int load_connected_play_sessions(void) {
     return __sync_add_and_fetch(&g_connected_play_sessions, 0);
 }
@@ -63,6 +75,15 @@ static void increment_connected_play_sessions(void) {
 }
 static void decrement_connected_play_sessions(void) {
     __sync_sub_and_fetch(&g_connected_play_sessions, 1);
+}
+static int load_active_connections(void) {
+    return __sync_add_and_fetch(&g_active_connections, 0);
+}
+static void increment_active_connections(void) {
+    __sync_add_and_fetch(&g_active_connections, 1);
+}
+static void decrement_active_connections(void) {
+    __sync_sub_and_fetch(&g_active_connections, 1);
 }
 #endif
 
@@ -73,6 +94,13 @@ typedef struct {
     int force_debug_spawn;
     int has_world_info;
 } client_stream_state_t;
+
+typedef struct {
+    socket_handle_t socket_fd;
+    socket_handle_t server_fd;
+    server_config_t server_config;
+    client_stream_state_t stream_state;
+} client_session_t;
 
 static void send_large_post_compression_packet(socket_handle_t socket_fd,
                                                const uint8_t *packet,
@@ -179,16 +207,13 @@ static int try_extract_position_from_play_packet(int32_t packet_id,
     return 1;
 }
 
-static int send_stream_chunk(socket_handle_t socket_fd,
+static int send_stream_chunk(client_session_t *session,
                              int32_t chunk_x,
                              int32_t chunk_z,
-                             const server_config_t *server_config,
-                             int force_debug_spawn,
-                             int has_world_info,
                              const world_info_t *world_info) {
     int sent_this = 0;
 
-    if (!force_debug_spawn && server_config->enable_real_chunks && has_world_info) {
+    if (!session->stream_state.force_debug_spawn && session->server_config.enable_real_chunks && session->stream_state.has_world_info) {
         if (world_info->has_spawn_chunk &&
             chunk_x == world_info->spawn_chunk_x &&
             chunk_z == world_info->spawn_chunk_z) {
@@ -200,7 +225,7 @@ static int send_stream_chunk(socket_handle_t socket_fd,
                 chunk_z,
                 &real_len);
             if (real_buf) {
-                send_large_post_compression_packet(socket_fd, real_buf, real_len);
+                send_large_post_compression_packet(session->socket_fd, real_buf, real_len);
                 if (g_log_chunk_sends) {
                     printf("Sent REAL chunk for (%d,%d), %zu bytes.\n", chunk_x, chunk_z, real_len);
                 }
@@ -219,7 +244,7 @@ static int send_stream_chunk(socket_handle_t socket_fd,
                     chunk_z,
                     &real_len);
                 if (real_buf) {
-                    send_large_post_compression_packet(socket_fd, real_buf, real_len);
+                    send_large_post_compression_packet(session->socket_fd, real_buf, real_len);
                     if (g_log_chunk_sends) {
                         printf("Sent REAL chunk for (%d,%d), %zu bytes.\n", chunk_x, chunk_z, real_len);
                     }
@@ -231,11 +256,11 @@ static int send_stream_chunk(socket_handle_t socket_fd,
         }
     }
 
-    if (!sent_this && (force_debug_spawn || !server_config->enable_real_chunks || server_config->allow_debug_chunk_fallback)) {
+    if (!sent_this && (session->stream_state.force_debug_spawn || !session->server_config.enable_real_chunks || session->server_config.allow_debug_chunk_fallback)) {
         size_t dbg_len = 0;
         uint8_t *dbg_buf = build_debug_flat_chunk_packet(chunk_x, chunk_z, &dbg_len);
         if (dbg_buf) {
-            send_large_post_compression_packet(socket_fd, dbg_buf, dbg_len);
+            send_large_post_compression_packet(session->socket_fd, dbg_buf, dbg_len);
             if (g_log_chunk_sends) {
                 printf("Sent DEBUG flat chunk for (%d,%d), %zu bytes.\n", chunk_x, chunk_z, dbg_len);
             }
@@ -497,116 +522,1025 @@ static void send_large_post_compression_packet(socket_handle_t socket_fd,
     free(frame);
 }
 
-static void try_serve_one_pending_status(socket_handle_t server_fd, const server_config_t *server_config) {
+static void close_client_socket(socket_handle_t socket_fd) {
 #ifdef _WIN32
-    SOCKET pending_socket = accept(server_fd, NULL, NULL);
-    if (pending_socket == INVALID_SOCKET) {
-        return;
+    closesocket(socket_fd);
+#else
+    close(socket_fd);
+#endif
+}
+
+static int parse_handshake_next_state(const uint8_t *buffer,
+                                      size_t bytes_read,
+                                      int32_t *out_next_state) {
+    const uint8_t *ptr = buffer;
+    size_t buflen = bytes_read;
+    int32_t packet_length = read_varint(&ptr, &buflen);
+    int32_t packet_id = read_varint(&ptr, &buflen);
+
+    printf("Received packet: length=%d, id=%d\n", packet_length, packet_id);
+    if (packet_id != 0x00) {
+        *out_next_state = -1;
+        return 0;
+    }
+
+    {
+        int32_t protocol_version = read_varint(&ptr, &buflen);
+        extern char *read_mc_string(const uint8_t **, size_t *);
+        char *server_address = read_mc_string(&ptr, &buflen);
+        uint16_t server_port = (uint16_t)(ptr[0] << 8 | ptr[1]);
+        ptr += 2;
+        buflen -= 2;
+        *out_next_state = read_varint(&ptr, &buflen);
+        printf("Handshake: proto=%d, addr=%s, port=%u, next_state=%d\n", protocol_version, server_address, server_port, *out_next_state);
+        free(server_address);
+    }
+
+    return 1;
+}
+
+static void handle_status_state(socket_handle_t socket_fd, const server_config_t *server_config) {
+    uint8_t status_buf[1024];
+#ifdef _WIN32
+    int status_bytes = recv(socket_fd, (char*)status_buf, sizeof(status_buf), 0);
+#else
+    ssize_t status_bytes = recv(socket_fd, status_buf, sizeof(status_buf), 0);
+#endif
+    if (status_bytes > 0) {
+        const uint8_t *sptr = status_buf;
+        size_t slen = (size_t)status_bytes;
+        int32_t splen = read_varint(&sptr, &slen);
+        int32_t spid = read_varint(&sptr, &slen);
+        (void)splen;
+
+        if (spid == 0x00) {
+            int displayed_online_players = resolve_displayed_online_players(server_config);
+            uint8_t outbuf[1024];
+            size_t outlen = build_status_response(
+                outbuf,
+                sizeof(outbuf),
+                server_config->protocol_name,
+                server_config->protocol_number,
+                server_config->max_players,
+                displayed_online_players,
+                server_config->motd);
+#ifdef _WIN32
+            send(socket_fd, (const char*)outbuf, (int)outlen, 0);
+#else
+            send(socket_fd, outbuf, outlen, 0);
+#endif
+            printf("Sent status response to client.\n");
+        }
+
+#ifdef _WIN32
+        int ping_bytes = recv(socket_fd, (char*)status_buf, sizeof(status_buf), 0);
+#else
+        ssize_t ping_bytes = recv(socket_fd, status_buf, sizeof(status_buf), 0);
+#endif
+        if (ping_bytes > 0) {
+#ifdef _WIN32
+            send(socket_fd, (const char*)status_buf, ping_bytes, 0);
+#else
+            send(socket_fd, status_buf, ping_bytes, 0);
+#endif
+            printf("Echoed ping packet to client.\n");
+        }
+    }
+}
+
+static void run_play_state_loop(client_session_t *session,
+                                socket_handle_t socket_fd,
+                                socket_handle_t server_fd,
+                                int has_world_info,
+                                int force_debug_spawn,
+                                world_info_t *world_info) {
+#ifdef _WIN32
+    {
+        DWORD timeout_ms = 1000;
+        setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout_ms, sizeof(timeout_ms));
     }
 #else
-    int pending_socket = accept(server_fd, NULL, NULL);
-    if (pending_socket < 0) {
-        return;
+    {
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
 #endif
 
     {
-        uint8_t buffer[1024];
-#ifdef _WIN32
-        int bytes_read = recv(pending_socket, (char*)buffer, sizeof(buffer), 0);
-#else
-        ssize_t bytes_read = recv(pending_socket, buffer, sizeof(buffer), 0);
-#endif
-        if (bytes_read > 0) {
-            const uint8_t *ptr = buffer;
-            size_t buflen = (size_t)bytes_read;
-            int32_t packet_length = read_varint(&ptr, &buflen);
-            int32_t packet_id = read_varint(&ptr, &buflen);
-            int32_t next_state = -1;
-            (void)packet_length;
-
-            if (packet_id == 0x00) {
-                int32_t protocol_version = read_varint(&ptr, &buflen);
-                extern char *read_mc_string(const uint8_t **, size_t *);
-                char *server_address = read_mc_string(&ptr, &buflen);
-                uint16_t server_port = (uint16_t)(ptr[0] << 8 | ptr[1]);
-                ptr += 2;
-                buflen -= 2;
-                next_state = read_varint(&ptr, &buflen);
-                (void)protocol_version;
-                (void)server_port;
-                free(server_address);
+        int entered_play_state = 1;
+        increment_connected_play_sessions();
+        time_t last_keepalive = time(NULL);
+        int64_t ka_id = 1;
+        for (;;) {
+            // Send Keep Alive every 10 seconds
+            time_t now = time(NULL);
+            if (now - last_keepalive >= 10) {
+                uint8_t ka_buf[32];
+                size_t ka_len = build_keep_alive_packet(ka_buf, sizeof(ka_buf), ka_id++);
+                send_post_compression_packet(socket_fd, ka_buf, ka_len);
+                printf("Sent Keep Alive (id=%lld).\n", (long long)(ka_id - 1));
+                last_keepalive = now;
             }
 
-            if (next_state == 1) {
-                uint8_t status_buf[1024];
-                size_t status_bytes = 0;
+            uint8_t play_buf[2048];
+#ifdef _WIN32
+            int play_bytes = recv(socket_fd, (char*)play_buf, sizeof(play_buf), 0);
+            if (play_bytes <= 0) {
+                if (WSAGetLastError() == WSAETIMEDOUT) continue;
+                break;
+            }
+#else
+            ssize_t play_bytes = recv(socket_fd, play_buf, sizeof(play_buf), 0);
+            if (play_bytes <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                break;
+            }
+#endif
+            {
+                int32_t play_pid = -1;
+                const uint8_t *play_payload = NULL;
+                size_t play_payload_len = 0;
+                uint8_t inflate_tmp[8192];
 
-                if (buflen > 0) {
-                    if (buflen > sizeof(status_buf)) {
-                        buflen = sizeof(status_buf);
+                if (read_post_compression_packet_data(
+                        play_buf,
+                        (size_t)play_bytes,
+                        &play_pid,
+                        &play_payload,
+                        &play_payload_len,
+                        inflate_tmp,
+                        sizeof(inflate_tmp))) {
+                    if (g_log_play_packets) {
+                        printf("Play packet ID from client: %d\n", play_pid);
                     }
-                    memcpy(status_buf, ptr, buflen);
-                    status_bytes = buflen;
+
+                    {
+                        double player_x = 0.0;
+                        double player_z = 0.0;
+                        if (try_extract_position_from_play_packet(
+                                play_pid,
+                                play_payload,
+                                play_payload_len,
+                                &player_x,
+                                &player_z)) {
+                            int32_t moved_chunk_x = (int32_t)floor(player_x / 16.0);
+                            int32_t moved_chunk_z = (int32_t)floor(player_z / 16.0);
+
+                            if (moved_chunk_x != session->stream_state.stream_center_chunk_x ||
+                                moved_chunk_z != session->stream_state.stream_center_chunk_z) {
+                                uint8_t center_buf[64];
+                                size_t center_len = build_set_center_chunk_packet(
+                                    center_buf,
+                                    sizeof(center_buf),
+                                    moved_chunk_x,
+                                    moved_chunk_z);
+                                send_post_compression_packet(socket_fd, center_buf, center_len);
+
+                                {
+                                    uint8_t cbs_buf[4];
+                                    size_t cbs_len = 0;
+                                    int sent_chunks = 0;
+                                    uint8_t cbf_buf[8];
+                                    size_t cbf_len = 0;
+
+                                    cbs_len += write_varint(cbs_buf + cbs_len, 0x0C);
+                                    send_post_compression_packet(socket_fd, cbs_buf, cbs_len);
+
+                                    for (int dz = -session->stream_state.chunk_stream_radius; dz <= session->stream_state.chunk_stream_radius; dz++) {
+                                        for (int dx = -session->stream_state.chunk_stream_radius; dx <= session->stream_state.chunk_stream_radius; dx++) {
+                                            int32_t sx = moved_chunk_x + dx;
+                                            int32_t sz = moved_chunk_z + dz;
+                                            int already_loaded =
+                                                abs(sx - session->stream_state.stream_center_chunk_x) <= session->stream_state.chunk_stream_radius &&
+                                                abs(sz - session->stream_state.stream_center_chunk_z) <= session->stream_state.chunk_stream_radius;
+
+                                            if (already_loaded) {
+                                                continue;
+                                            }
+
+                                            if (send_stream_chunk(session, sx, sz, world_info)) {
+                                                sent_chunks += 1;
+                                            }
+                                        }
+                                    }
+
+                                    cbf_len += write_varint(cbf_buf + cbf_len, 0x0B);
+                                    cbf_len += write_varint(cbf_buf + cbf_len, sent_chunks);
+                                    send_post_compression_packet(socket_fd, cbf_buf, cbf_len);
+                                }
+
+                                session->stream_state.stream_center_chunk_x = moved_chunk_x;
+                                session->stream_state.stream_center_chunk_z = moved_chunk_z;
+                            }
+                        }
+                    }
                 } else {
-#ifdef _WIN32
-                    int recv_bytes = recv(pending_socket, (char*)status_buf, sizeof(status_buf), 0);
-#else
-                    ssize_t recv_bytes = recv(pending_socket, status_buf, sizeof(status_buf), 0);
-#endif
-                    if (recv_bytes > 0) {
-                        status_bytes = (size_t)recv_bytes;
-                    }
-                }
-
-                if (status_bytes > 0) {
-                    const uint8_t *sptr = status_buf;
-                    size_t slen = status_bytes;
-                    int32_t splen = read_varint(&sptr, &slen);
-                    int32_t spid = read_varint(&sptr, &slen);
-                    (void)splen;
-
-                    if (spid == 0x00) {
-                        int displayed_online_players = resolve_displayed_online_players(server_config);
-                        uint8_t outbuf[1024];
-                        size_t outlen = build_status_response(
-                            outbuf,
-                            sizeof(outbuf),
-                            server_config->protocol_name,
-                            server_config->protocol_number,
-                            server_config->max_players,
-                            displayed_online_players,
-                            server_config->motd);
-#ifdef _WIN32
-                        send(pending_socket, (const char*)outbuf, (int)outlen, 0);
-#else
-                        send(pending_socket, outbuf, outlen, 0);
-#endif
-                    }
-
-#ifdef _WIN32
-                    int ping_bytes = recv(pending_socket, (char*)status_buf, sizeof(status_buf), 0);
-#else
-                    ssize_t ping_bytes = recv(pending_socket, status_buf, sizeof(status_buf), 0);
-#endif
-                    if (ping_bytes > 0) {
-#ifdef _WIN32
-                        send(pending_socket, (const char*)status_buf, ping_bytes, 0);
-#else
-                        send(pending_socket, status_buf, ping_bytes, 0);
-#endif
+                    if (g_log_packet_framing) {
+                        printf("Failed to parse play packet in post-compression format.\n");
                     }
                 }
             }
         }
+
+        if (entered_play_state) {
+            decrement_connected_play_sessions();
+        }
     }
 
-#ifdef _WIN32
-    closesocket(pending_socket);
-#else
-    close(pending_socket);
-#endif
+    (void)server_fd;
+    (void)has_world_info;
+    (void)force_debug_spawn;
 }
+
+static void handle_client_connection(client_session_t *session) {
+    socket_handle_t new_socket = session->socket_fd;
+    socket_handle_t server_fd = session->server_fd;
+    server_config_t server_config = session->server_config;
+
+    // Read handshake packet (blocking, simple version)
+    uint8_t buffer[1024];
+#ifdef _WIN32
+    int bytes_read = recv(new_socket, (char*)buffer, sizeof(buffer), 0);
+#else
+    ssize_t bytes_read = recv(new_socket, buffer, sizeof(buffer), 0);
+#endif
+    if (bytes_read <= 0) {
+        close_client_socket(new_socket);
+        return;
+    }
+
+    {
+        int32_t next_state = -1;
+        if (!parse_handshake_next_state(buffer, (size_t)bytes_read, &next_state)) {
+            close_client_socket(new_socket);
+            return;
+        }
+
+        if (next_state == 1) {
+            handle_status_state(new_socket, &server_config);
+            close_client_socket(new_socket);
+            return;
+        }
+
+        if (next_state != 2) {
+            close_client_socket(new_socket);
+            return;
+        }
+    }
+
+    // Wait for Login Start packet (id 0x00)
+    {
+        uint8_t login_buf[1024];
+#ifdef _WIN32
+        int login_bytes = recv(new_socket, (char*)login_buf, sizeof(login_buf), 0);
+#else
+        ssize_t login_bytes = recv(new_socket, login_buf, sizeof(login_buf), 0);
+#endif
+        if (login_bytes <= 0) {
+            close_client_socket(new_socket);
+            return;
+        }
+
+        {
+            const uint8_t *lptr = login_buf;
+            size_t llen = login_bytes;
+            int32_t lplen = read_varint(&lptr, &llen);
+            int32_t lpid = read_varint(&lptr, &llen);
+            (void)lplen;
+            if (lpid != 0x00) {
+                close_client_socket(new_socket);
+                return;
+            }
+
+            // Parse username (MC String)
+            extern char *read_mc_string(const uint8_t **, size_t *);
+            {
+                char *username = read_mc_string(&lptr, &llen);
+                if (!username) {
+                    close_client_socket(new_socket);
+                    return;
+                }
+                printf("Login Start: username=%s\n", username);
+
+
+                // Send Set Compression packet (id 0x03, Login state)
+                printf("Preparing to send Set Compression...\n");
+                extern size_t build_set_compression_packet(uint8_t *, size_t, int);
+                uint8_t comp_buf[16];
+                size_t comp_buf_len = build_set_compression_packet(
+                    comp_buf,
+                    sizeof(comp_buf),
+                    server_config.compression_threshold);
+                printf("Set Compression packet (hex): ");
+                for (size_t i = 0; i < comp_buf_len; ++i) printf("%02X ", comp_buf[i]);
+                printf("\n");
+
+                // Send Set Compression with a single frame (not double-framed)
+#ifdef _WIN32
+                send(new_socket, (const char*)comp_buf, (int)comp_buf_len, 0);
+#else
+                send(new_socket, comp_buf, comp_buf_len, 0);
+#endif
+                printf("Sent Set Compression to client.\n");
+
+                // Add a short delay to ensure client processes Set Compression before Login Success
+#ifdef _WIN32
+                Sleep(50); // milliseconds
+#else
+                usleep(50000); // microseconds
+#endif
+
+                // Send Login Success packet (id 0x02)
+                printf("Preparing to send Login Success...\n");
+                // login_finished (id 0x02): Profile = UUID(16) + username + properties[]
+                uint8_t uuid[16];
+                extern void write_offline_mode_uuid(uint8_t *, const char *);
+                write_offline_mode_uuid(uuid, username);
+                printf("Login Success UUID bytes (offline-mode from username: %s): ", username);
+                for (size_t i = 0; i < sizeof(uuid); ++i) printf("%02X ", uuid[i]);
+                printf("\n");
+
+                // Encode username as MC String
+                uint8_t unamebuf[64];
+                extern size_t write_varint(uint8_t *, int32_t);
+                size_t uname_len = strlen(username);
+                size_t uname_varint = write_varint(unamebuf, (int32_t)uname_len);
+                memcpy(unamebuf + uname_varint, username, uname_len);
+
+                // Print username encoding for debug
+                printf("Login Success username (len=%zu): ", uname_len);
+                for (size_t i = 0; i < uname_varint + uname_len; ++i) printf("%02X ", unamebuf[i]);
+                printf("\n");
+
+
+                // Build Login Success packet (raw, no length prefix)
+                uint8_t packet[128];
+                size_t offset = 0;
+                offset += write_varint(packet + offset, 0x02); // Login Success packet id
+                memcpy(packet + offset, uuid, sizeof(uuid));
+                offset += sizeof(uuid);
+                memcpy(packet + offset, unamebuf, uname_varint + uname_len);
+                offset += uname_varint + uname_len;
+                // Add properties (VarInt 0 for empty array)
+                offset += write_varint(packet + offset, 0);
+
+                // Print raw Login Success packet (no length prefix)
+                printf("Raw Login Success packet (hex): ");
+                for (size_t i = 0; i < offset; ++i) printf("%02X ", packet[i]);
+                printf("\n");
+
+                // Login Success double-framing (pass only raw packet, no length prefix)
+                uint8_t double_framed[512];
+                size_t double_framed_len = double_frame_packet(double_framed, packet, offset);
+                printf("Double Framed Login Success packet (hex): ");
+                for (size_t i = 0; i < double_framed_len; ++i) printf("%02X ", double_framed[i]);
+                printf("\n");
+                // Send Login Success
+#ifdef _WIN32
+                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                printf("Sent Login Success to client.\n");
+
+                // Wait for Login Acknowledged (0x03) from client
+                {
+                    uint8_t ack_buf[256];
+#ifdef _WIN32
+                    int ack_bytes = recv(new_socket, (char*)ack_buf, sizeof(ack_buf), 0);
+#else
+                    ssize_t ack_bytes = recv(new_socket, ack_buf, sizeof(ack_buf), 0);
+#endif
+                    if (ack_bytes > 0) {
+                        printf("Received packet after Login Success: ");
+                        for (int i = 0; i < ack_bytes; ++i) printf("%02X ", ack_buf[i]);
+                        printf("\n");
+                        {
+                            int32_t ackpid = -1;
+                            if (!read_post_compression_packet_id(ack_buf, (size_t)ack_bytes, &ackpid)) {
+                                printf("Failed to parse packet after Login Success (post-compression format).\n");
+                                free(username);
+                                close_client_socket(new_socket);
+                                return;
+                            }
+                            printf("Parsed packet ID: %d\n", ackpid);
+                            if (ackpid == 0x03) {
+                                // Send minimal 1.21 configuration packets
+                                extern size_t build_known_packs_packet(uint8_t *, size_t);
+                                extern size_t build_feature_flags_packet(uint8_t *, size_t);
+                                extern size_t build_finish_config_packet(uint8_t *, size_t);
+                                extern size_t build_join_game_packet(uint8_t *, size_t);
+                                extern size_t build_player_pos_packet(uint8_t *, size_t);
+                                config_replay_t replay;
+                                const char *replay_path = NULL;
+                                int have_replay;
+                                uint8_t cfg_buf[1024]; // 1024 to accommodate damage_type (25 entries ~548 bytes)
+                                size_t cfg_len;
+                                uint8_t double_framed[2048];
+                                size_t double_framed_len;
+
+                                // Known Packs (required for proper registry bootstrap in 1.21+)
+                                cfg_len = build_known_packs_packet(cfg_buf, sizeof(cfg_buf));
+                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                printf("Sent Known Packs to client.\n");
+
+                                // Wait for Serverbound Known Packs (id 0x07).
+                                {
+                                    int got_known_packs = 0;
+                                    for (;;) {
+                                        uint8_t kp_buf[1024];
+#ifdef _WIN32
+                                        int kp_bytes = recv(new_socket, (char*)kp_buf, sizeof(kp_buf), 0);
+#else
+                                        ssize_t kp_bytes = recv(new_socket, kp_buf, sizeof(kp_buf), 0);
+#endif
+                                        if (kp_bytes <= 0) {
+                                            break;
+                                        }
+
+                                        {
+                                            int32_t kp_pid = -1;
+                                            if (!read_post_compression_packet_id(kp_buf, (size_t)kp_bytes, &kp_pid)) {
+                                                printf("Failed to parse config packet during known-packs negotiation.\n");
+                                                continue;
+                                            }
+                                            printf("Parsed config packet ID: %d\n", kp_pid);
+                                            if (kp_pid == 0x07) {
+                                                got_known_packs = 1;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (!got_known_packs) {
+                                        printf("Did not receive Serverbound Known Packs (0x07).\n");
+                                        free(username);
+                                        close_client_socket(new_socket);
+                                        return;
+                                    }
+                                }
+
+                                have_replay = load_config_replay_with_fallbacks(&replay, &replay_path);
+                                if (have_replay) {
+                                    int replay_sent_finish = 0;
+                                    printf("Loaded config replay with %zu packets from %s\n", replay.count, replay_path);
+                                    for (size_t i = 0; i < replay.count; ++i) {
+                                        int32_t replay_pid;
+                                        const uint8_t *pptr = replay.packets[i];
+                                        size_t plen = replay.lengths[i];
+
+                                        replay_pid = read_varint(&pptr, &plen);
+                                        double_framed_len = double_frame_packet(double_framed, replay.packets[i], replay.lengths[i]);
+#ifdef _WIN32
+                                        send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                        send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                        printf("Sent replay config packet id=%d len=%zu\n", replay_pid, replay.lengths[i]);
+                                        if (replay_pid == 0x03) {
+                                            replay_sent_finish = 1;
+                                        }
+                                    }
+
+                                    if (!replay_sent_finish) {
+                                        cfg_len = build_finish_config_packet(cfg_buf, sizeof(cfg_buf));
+                                        double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                        send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                        send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                        printf("Sent Finish Configuration to client.\n");
+                                    }
+                                } else {
+                                    // Minimal fallback when no replay file is present.
+                                    cfg_len = build_feature_flags_packet(cfg_buf, sizeof(cfg_buf));
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Feature Flags to client.\n");
+
+                                    cfg_len = build_registry_data_packet(cfg_buf, sizeof(cfg_buf));
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (dimension_type) to client.\n");
+
+                                    cfg_len = build_registry_data_biome_packet(cfg_buf, sizeof(cfg_buf));
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (biome) to client.\n");
+
+                                    cfg_len = build_registry_data_damage_type(cfg_buf, sizeof(cfg_buf));
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (damage_type) to client.\n");
+
+                                    // Required non-empty dynamic registries added in 1.21.5+
+                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:cat_variant", "minecraft:tabby");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (cat_variant) to client.\n");
+
+                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:chicken_variant", "minecraft:temperate");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (chicken_variant) to client.\n");
+
+                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:cow_variant", "minecraft:temperate");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (cow_variant) to client.\n");
+
+                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:frog_variant", "minecraft:temperate");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (frog_variant) to client.\n");
+
+                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:painting_variant", "minecraft:kebab");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (painting_variant) to client.\n");
+
+                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:pig_variant", "minecraft:temperate");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (pig_variant) to client.\n");
+
+                                    cfg_len = build_registry_data_inline_empty(cfg_buf, sizeof(cfg_buf), "minecraft:timeline", "minecraft:overworld");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (timeline) to client.\n");
+
+                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:wolf_sound_variant", "minecraft:classic");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (wolf_sound_variant) to client.\n");
+
+                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:wolf_variant", "minecraft:pale");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (wolf_variant) to client.\n");
+
+                                    cfg_len = build_registry_data_with_asset_id(cfg_buf, sizeof(cfg_buf), "minecraft:zombie_nautilus_variant", "minecraft:temperate", "minecraft:zombie_nautilus");
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Registry Data (zombie_nautilus_variant) to client.\n");
+
+                                    // Update Tags: bind minecraft:timeline#minecraft:in_overworld to entry 0
+                                    cfg_len = build_update_tags_with_timeline(cfg_buf, sizeof(cfg_buf));
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Update Tags to client.\n");
+
+                                    cfg_len = build_finish_config_packet(cfg_buf, sizeof(cfg_buf));
+                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+#ifdef _WIN32
+                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
+#else
+                                    send(new_socket, double_framed, double_framed_len, 0);
+#endif
+                                    printf("Sent Finish Configuration to client.\n");
+                                }
+
+                                // Wait for Acknowledge Finish Configuration (serverbound id 0x03).
+                                // The client may send other configuration packets first (e.g. plugin/client info).
+                                {
+                                    int got_finish_ack = 0;
+                                    for (;;) {
+                                        uint8_t cfg_ack_buf[512];
+#ifdef _WIN32
+                                        int cfg_ack_bytes = recv(new_socket, (char*)cfg_ack_buf, sizeof(cfg_ack_buf), 0);
+#else
+                                        ssize_t cfg_ack_bytes = recv(new_socket, cfg_ack_buf, sizeof(cfg_ack_buf), 0);
+#endif
+                                        if (cfg_ack_bytes <= 0) {
+                                            break;
+                                        }
+
+                                        {
+                                            int32_t cfg_pid = -1;
+                                            if (!read_post_compression_packet_id(cfg_ack_buf, (size_t)cfg_ack_bytes, &cfg_pid)) {
+                                                printf("Failed to parse config packet (post-compression format).\n");
+                                                continue;
+                                            }
+
+                                            printf("Parsed config packet ID: %d\n", cfg_pid);
+                                            if (cfg_pid == 0x03) {
+                                                got_finish_ack = 1;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (!got_finish_ack) {
+                                        free_config_replay(&replay);
+                                        printf("Did not receive Acknowledge Finish Configuration (0x03).\n");
+                                        free(username);
+                                        close_client_socket(new_socket);
+                                        return;
+                                    }
+                                }
+
+                                free_config_replay(&replay);
+
+                                // Load world metadata for play bootstrap if a world folder is available.
+                                {
+                                    world_info_t world_info;
+                                    char world_error[256];
+                                    int has_world_info = load_world_info(
+                                        &world_info,
+                                        server_config.world_path,
+                                        world_error,
+                                        sizeof(world_error));
+
+                                    if (has_world_info) {
+                                        printf("Loaded world '%s' spawn=(%d,%d,%d) chunk=(%d,%d) chunk_nbt=%s (%zu bytes)\n",
+                                            world_info.world_path,
+                                            world_info.spawn_x,
+                                            world_info.spawn_y,
+                                            world_info.spawn_z,
+                                            world_info.spawn_chunk_x,
+                                            world_info.spawn_chunk_z,
+                                            world_info.has_spawn_chunk ? "yes" : "no",
+                                            world_info.spawn_chunk_nbt_len);
+                                    } else {
+                                        printf("World data not loaded: %s\n", world_error);
+                                    }
+
+                                    {
+                                        int force_debug_spawn = server_config.force_debug_spawn || env_flag_enabled("VECTORA_FORCE_DEBUG_SPAWN");
+                                        if (force_debug_spawn) {
+                                            printf("VECTORA_FORCE_DEBUG_SPAWN enabled: forcing debug chunks and debug spawn.\n");
+                                        }
+
+                                        // Join Game
+                                        {
+                                            uint8_t jg_buf[1024];
+                                            join_game_params_t join_params;
+                                            memset(&join_params, 0, sizeof(join_params));
+                                            join_params.entity_id = 1;
+                                            join_params.dimension_name = has_world_info ? world_info.dimension_name : "minecraft:overworld";
+                                            join_params.max_players = server_config.max_players;
+                                            join_params.view_distance = server_config.view_distance;
+                                            join_params.simulation_distance = server_config.simulation_distance;
+                                            join_params.game_mode = (uint8_t)server_config.game_mode;
+                                            join_params.difficulty = (uint8_t)server_config.difficulty;
+                                            join_params.previous_game_mode = -1;
+                                            join_params.sea_level = has_world_info ? world_info.sea_level : 63;
+                                            join_params.is_flat = has_world_info ? world_info.is_flat : 0;
+                                            size_t jg_len = build_join_game_packet_ex(jg_buf, sizeof(jg_buf), &join_params);
+                                            send_post_compression_packet(new_socket, jg_buf, jg_len);
+                                            printf("Sent Join Game to client.\n");
+                                        }
+
+                                        if (server_config.send_brand_packet) {
+                                            uint8_t brand_buf[256];
+                                            size_t brand_len = build_brand_packet(brand_buf, sizeof(brand_buf), server_config.server_brand);
+                                            send_post_compression_packet(new_socket, brand_buf, brand_len);
+                                            printf("Sent server brand: %s.\n", server_config.server_brand);
+                                        }
+
+                                        // Game Event type 13: "Start waiting for level chunks"
+                                        // Required since 1.20.3 — without it the client never leaves "Loading terrain"
+                                        if (server_config.send_wait_for_level_chunks_event) {
+                                            uint8_t ge_buf[32];
+                                            size_t ge_len = build_game_event_packet(ge_buf, sizeof(ge_buf), 13, 0.0f);
+                                            send_post_compression_packet(new_socket, ge_buf, ge_len);
+                                            printf("Sent Game Event 13 (Start waiting for level chunks).\n");
+                                        }
+
+                                        {
+                                            int32_t debug_chunk_x = has_world_info ? world_info.spawn_chunk_x : 0;
+                                            int32_t debug_chunk_z = has_world_info ? world_info.spawn_chunk_z : 0;
+                                            int32_t debug_spawn_x = debug_chunk_x * 16 + 8;
+                                            int32_t debug_spawn_z = debug_chunk_z * 16 + 8;
+                                            int32_t debug_spawn_y = 82;
+                                            int32_t player_spawn_x = debug_spawn_x;
+                                            int32_t player_spawn_y = debug_spawn_y;
+                                            int32_t player_spawn_z = debug_spawn_z;
+                                            int center_chunk_real = 0;
+                                            session->stream_state.chunk_stream_radius = resolve_chunk_stream_radius(&server_config);
+                                            session->stream_state.stream_center_chunk_x = debug_chunk_x;
+                                            session->stream_state.stream_center_chunk_z = debug_chunk_z;
+                                            session->stream_state.force_debug_spawn = force_debug_spawn;
+                                            session->stream_state.has_world_info = has_world_info;
+
+                                            // Always send Set Center Chunk so the client knows where to load chunks.
+                                            {
+                                                int32_t cx = debug_chunk_x;
+                                                int32_t cz = debug_chunk_z;
+                                                uint8_t center_buf[64];
+                                                size_t center_len = build_set_center_chunk_packet(center_buf, sizeof(center_buf), cx, cz);
+                                                send_post_compression_packet(new_socket, center_buf, center_len);
+                                                printf("Sent Set Center Chunk for (%d,%d).\n", cx, cz);
+                                            }
+
+                                            // Send an initial chunk area around center so nearby terrain renders reliably.
+                                            {
+                                                int32_t chunk_x = debug_chunk_x;
+                                                int32_t chunk_z = debug_chunk_z;
+
+                                                // ChunkBatchStart (0x0C) — no fields
+                                                uint8_t cbs_buf[4];
+                                                size_t cbs_len = 0;
+                                                cbs_len += write_varint(cbs_buf + cbs_len, 0x0C);
+                                                send_post_compression_packet(new_socket, cbs_buf, cbs_len);
+
+                                                (void)has_world_info;
+
+                                                {
+                                                    int sent_chunks = 0;
+
+                                                    for (int dz = -session->stream_state.chunk_stream_radius; dz <= session->stream_state.chunk_stream_radius; dz++) {
+                                                        for (int dx = -session->stream_state.chunk_stream_radius; dx <= session->stream_state.chunk_stream_radius; dx++) {
+                                                            int32_t sx = chunk_x + dx;
+                                                            int32_t sz = chunk_z + dz;
+                                                            int sent_this = 0;
+
+                                                            if (!session->stream_state.force_debug_spawn && server_config.enable_real_chunks && session->stream_state.has_world_info && world_info.has_spawn_chunk &&
+                                                                sx == world_info.spawn_chunk_x && sz == world_info.spawn_chunk_z) {
+                                                                size_t real_len = 0;
+                                                                uint8_t *real_buf = build_chunk_data_packet(
+                                                                    world_info.spawn_chunk_nbt,
+                                                                    world_info.spawn_chunk_nbt_len,
+                                                                    sx,
+                                                                    sz,
+                                                                    &real_len);
+                                                                if (real_buf) {
+                                                                    send_large_post_compression_packet(new_socket, real_buf, real_len);
+                                                                    sent_chunks++;
+                                                                    sent_this = 1;
+                                                                    center_chunk_real = 1;
+                                                                    if (g_log_chunk_sends) {
+                                                                        printf("Sent REAL chunk for (%d,%d), %zu bytes.\n", sx, sz, real_len);
+                                                                    }
+                                                                    free(real_buf);
+                                                                } else {
+                                                                    printf("WARNING: failed to build REAL chunk packet (%d,%d), falling back to DEBUG.\n", sx, sz);
+                                                                }
+                                                            } else if (!session->stream_state.force_debug_spawn && server_config.enable_real_chunks && session->stream_state.has_world_info) {
+                                                                uint8_t *chunk_nbt = NULL;
+                                                                size_t chunk_nbt_len = 0;
+                                                                if (load_chunk_nbt_at(&world_info, sx, sz, &chunk_nbt, &chunk_nbt_len)) {
+                                                                    size_t real_len = 0;
+                                                                    uint8_t *real_buf = build_chunk_data_packet(
+                                                                        chunk_nbt,
+                                                                        chunk_nbt_len,
+                                                                        sx,
+                                                                        sz,
+                                                                        &real_len);
+                                                                    if (real_buf) {
+                                                                        send_large_post_compression_packet(new_socket, real_buf, real_len);
+                                                                        sent_chunks++;
+                                                                        sent_this = 1;
+                                                                        if (g_log_chunk_sends) {
+                                                                            printf("Sent REAL chunk for (%d,%d), %zu bytes.\n", sx, sz, real_len);
+                                                                        }
+                                                                        free(real_buf);
+                                                                    } else {
+                                                                        printf("WARNING: failed to build REAL chunk packet (%d,%d), falling back to DEBUG.\n", sx, sz);
+                                                                    }
+                                                                    free(chunk_nbt);
+                                                                }
+                                                            }
+
+                                                            if (!sent_this && (session->stream_state.force_debug_spawn || !server_config.enable_real_chunks || server_config.allow_debug_chunk_fallback)) {
+                                                                size_t dbg_len = 0;
+                                                                uint8_t *dbg_buf = build_debug_flat_chunk_packet(sx, sz, &dbg_len);
+                                                                if (dbg_buf) {
+                                                                    send_large_post_compression_packet(new_socket, dbg_buf, dbg_len);
+                                                                    sent_chunks++;
+                                                                    if (g_log_chunk_sends) {
+                                                                        printf("Sent DEBUG flat chunk for (%d,%d), %zu bytes.\n", sx, sz, dbg_len);
+                                                                    }
+                                                                    free(dbg_buf);
+                                                                } else {
+                                                                    printf("WARNING: failed to build DEBUG flat chunk packet (%d,%d).\n", sx, sz);
+                                                                }
+                                                            } else if (!sent_this) {
+                                                                printf("WARNING: no chunk sent for (%d,%d) because debug fallback is disabled.\n", sx, sz);
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // ChunkBatchFinished (0x0B)
+                                                    {
+                                                        uint8_t cbf_buf[8];
+                                                        size_t cbf_len = 0;
+                                                        cbf_len += write_varint(cbf_buf + cbf_len, 0x0B);
+                                                        cbf_len += write_varint(cbf_buf + cbf_len, sent_chunks);
+                                                        send_post_compression_packet(new_socket, cbf_buf, cbf_len);
+                                                        printf("Sent ChunkBatchFinished (batch size=%d).\n", sent_chunks);
+                                                    }
+
+                                                    if (!force_debug_spawn && server_config.enable_real_chunks && center_chunk_real && has_world_info) {
+                                                        int32_t safe_spawn_y = 0;
+                                                        int have_safe_spawn = compute_safe_spawn_y_from_chunk_nbt(
+                                                            world_info.spawn_chunk_nbt,
+                                                            world_info.spawn_chunk_nbt_len,
+                                                            world_info.spawn_x,
+                                                            world_info.spawn_z,
+                                                            &safe_spawn_y);
+
+                                                        player_spawn_x = world_info.spawn_x;
+                                                        if (have_safe_spawn) {
+                                                            player_spawn_y = (safe_spawn_y < 319) ? (safe_spawn_y + 1) : safe_spawn_y;
+                                                        } else {
+                                                            player_spawn_y = (world_info.spawn_y + 16 > 200) ? (world_info.spawn_y + 16) : 200;
+                                                        }
+                                                        player_spawn_z = world_info.spawn_z;
+                                                        printf("Using real-world spawn at (%d,%d,%d)%s.\n",
+                                                               player_spawn_x,
+                                                               player_spawn_y,
+                                                               player_spawn_z,
+                                                               have_safe_spawn ? " from WORLD_SURFACE" : " with high-alt fallback");
+                                                    } else {
+                                                        player_spawn_x = debug_spawn_x;
+                                                        player_spawn_y = debug_spawn_y;
+                                                        player_spawn_z = debug_spawn_z;
+                                                        printf("Using debug spawn at (%d,%d,%d).\n", player_spawn_x, player_spawn_y, player_spawn_z);
+                                                    }
+                                                }
+                                            }
+
+                                            // Move the client's loading area to the real world spawn chunk when available.
+                                            if (has_world_info) {
+                                                uint8_t spawn_buf[128];
+                                                size_t spawn_len = build_set_default_spawn_packet(
+                                                    spawn_buf,
+                                                    sizeof(spawn_buf),
+                                                    world_info.dimension_name,
+                                                    player_spawn_x,
+                                                    player_spawn_y,
+                                                    player_spawn_z,
+                                                    world_info.spawn_yaw,
+                                                    world_info.spawn_pitch);
+                                                send_post_compression_packet(new_socket, spawn_buf, spawn_len);
+                                                printf("Sent Default Spawn Position.\n");
+                                            } else {
+                                                uint8_t spawn_buf[128];
+                                                size_t spawn_len = build_set_default_spawn_packet(
+                                                    spawn_buf,
+                                                    sizeof(spawn_buf),
+                                                    "minecraft:overworld",
+                                                    player_spawn_x,
+                                                    player_spawn_y,
+                                                    player_spawn_z,
+                                                    0.0f,
+                                                    0.0f);
+                                                send_post_compression_packet(new_socket, spawn_buf, spawn_len);
+                                                printf("Sent Default Spawn Position fallback.\n");
+                                            }
+
+                                            {
+                                                uint8_t time_buf[64];
+                                                size_t time_len = build_update_time_packet(time_buf, sizeof(time_buf), 0, 1000, 1);
+                                                send_post_compression_packet(new_socket, time_buf, time_len);
+                                                printf("Sent Update Time.\n");
+                                            }
+
+                                            // Player Position and Look
+                                            {
+                                                uint8_t pos_buf[128];
+                                                player_pos_params_t pos_params;
+                                                memset(&pos_params, 0, sizeof(pos_params));
+                                                pos_params.teleport_id = 1;
+                                                pos_params.x = (double)player_spawn_x + 0.5;
+                                                pos_params.y = (double)player_spawn_y;
+                                                pos_params.z = (double)player_spawn_z + 0.5;
+                                                pos_params.yaw = (!force_debug_spawn && has_world_info) ? world_info.spawn_yaw : 0.0f;
+                                                pos_params.pitch = (!force_debug_spawn && has_world_info) ? world_info.spawn_pitch : 0.0f;
+                                                {
+                                                    size_t pos_len = build_player_pos_packet_ex(pos_buf, sizeof(pos_buf), &pos_params);
+                                                    send_post_compression_packet(new_socket, pos_buf, pos_len);
+                                                }
+                                                printf("Sent Player Position and Look to client.\n");
+                                            }
+
+                                            run_play_state_loop(
+                                                session,
+                                                new_socket,
+                                                server_fd,
+                                                has_world_info,
+                                                force_debug_spawn,
+                                                &world_info);
+
+                                            if (has_world_info) {
+                                                free_world_info(&world_info);
+                                            }
+                                        }
+                                    }
+
+                                    close_client_socket(new_socket);
+                                }
+                            } else {
+                                printf("Did not receive Login Acknowledged (got id=%d)\n", ackpid);
+                                free(username);
+                                close_client_socket(new_socket);
+                                return;
+                            }
+                        }
+                    } else {
+                        printf("No packet received after Login Success.\n");
+                        free(username);
+                        close_client_socket(new_socket);
+                        return;
+                    }
+                }
+
+                free(username);
+            }
+        }
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI client_worker_thread(LPVOID arg) {
+    client_session_t *session = (client_session_t*)arg;
+    if (session) {
+        handle_client_connection(session);
+        free(session);
+    }
+    decrement_active_connections();
+    return 0;
+}
+#else
+static void *client_worker_thread(void *arg) {
+    client_session_t *session = (client_session_t*)arg;
+    if (session) {
+        handle_client_connection(session);
+        free(session);
+    }
+    decrement_active_connections();
+    return NULL;
+}
+#endif
 
 int main() {
     server_config_t server_config;
@@ -704,969 +1638,75 @@ int main() {
     printf("Vectora server listening on port %d...\n", server_config.port);
 
     while (1) {
+        addrlen = sizeof(address);
         new_socket = (int)accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
         if (new_socket < 0) {
-                // Set TCP_NODELAY to disable Nagle's algorithm (immediate send)
-            #ifdef _WIN32
-                {
-                    BOOL flag = 1;
-                    setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
-                }
-            #else
-                {
-                    int flag = 1;
-                    setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-                }
-            #endif
             perror("accept");
-#ifdef _WIN32
-            closesocket(server_fd);
-            WSACleanup();
-#endif
-            exit(EXIT_FAILURE);
-        }
-        printf("New connection accepted!\n");
-
-        // Read handshake packet (blocking, simple version)
-        uint8_t buffer[1024];
-#ifdef _WIN32
-        int bytes_read = recv(new_socket, (char*)buffer, sizeof(buffer), 0);
-#else
-        ssize_t bytes_read = recv(new_socket, buffer, sizeof(buffer), 0);
-#endif
-        if (bytes_read <= 0) {
-#ifdef _WIN32
-            closesocket(new_socket);
-#else
-            close(new_socket);
-#endif
             continue;
         }
 
-        // Parse packet length (VarInt)
-        const uint8_t *ptr = buffer;
-        size_t buflen = bytes_read;
-        int32_t packet_length = read_varint(&ptr, &buflen);
-        int32_t packet_id = read_varint(&ptr, &buflen);
-        printf("Received packet: length=%d, id=%d\n", packet_length, packet_id);
+        // Set TCP_NODELAY to disable Nagle's algorithm (immediate send)
+#ifdef _WIN32
+        {
+            BOOL flag = 1;
+            setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
+        }
+#else
+        {
+            int flag = 1;
+            setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        }
+#endif
 
-        // Handshake (packet_id 0x00) parsing
-        int32_t next_state = -1;
-        if (packet_id == 0x00) {
-            int32_t protocol_version = read_varint(&ptr, &buflen);
-            extern char *read_mc_string(const uint8_t **, size_t *);
-            char *server_address = read_mc_string(&ptr, &buflen);
-            uint16_t server_port = (uint16_t)(ptr[0] << 8 | ptr[1]);
-            ptr += 2; buflen -= 2;
-            next_state = read_varint(&ptr, &buflen);
-            printf("Handshake: proto=%d, addr=%s, port=%u, next_state=%d\n", protocol_version, server_address, server_port, next_state);
-            free(server_address);
+        printf("New connection accepted!\n");
+
+        // Check if we've reached max connections
+        if (load_active_connections() >= server_config.max_connections) {
+            fprintf(stderr, "Max connections (%d) reached, rejecting new connection.\n", server_config.max_connections);
+            close_client_socket(new_socket);
+            continue;
         }
 
-        // If next_state is 1 (status), handle status request/response
-        if (next_state == 1) {
-            // Wait for Status Request packet (id 0x00)
-            uint8_t status_buf[1024];
-#ifdef _WIN32
-            int status_bytes = recv(new_socket, (char*)status_buf, sizeof(status_buf), 0);
-#else
-            ssize_t status_bytes = recv(new_socket, status_buf, sizeof(status_buf), 0);
-#endif
-            if (status_bytes > 0) {
-                const uint8_t *sptr = status_buf;
-                size_t slen = status_bytes;
-                int32_t splen = read_varint(&sptr, &slen);
-                int32_t spid = read_varint(&sptr, &slen);
-                if (spid == 0x00) {
-                    int displayed_online_players = resolve_displayed_online_players(&server_config);
-
-                    // Send Status Response
-                    uint8_t outbuf[1024];
-                    size_t outlen = build_status_response(
-                        outbuf,
-                        sizeof(outbuf),
-                        server_config.protocol_name,
-                        server_config.protocol_number,
-                        server_config.max_players,
-                        displayed_online_players,
-                        server_config.motd);
-#ifdef _WIN32
-                    send(new_socket, (const char*)outbuf, (int)outlen, 0);
-#else
-                    send(new_socket, outbuf, outlen, 0);
-#endif
-                    printf("Sent status response to client.\n");
-                }
-                // Wait for Ping packet (id 0x01)
-#ifdef _WIN32
-                int ping_bytes = recv(new_socket, (char*)status_buf, sizeof(status_buf), 0);
-#else
-                ssize_t ping_bytes = recv(new_socket, status_buf, sizeof(status_buf), 0);
-#endif
-                if (ping_bytes > 0) {
-                    // Echo back the ping packet
-#ifdef _WIN32
-                    send(new_socket, (const char*)status_buf, ping_bytes, 0);
-#else
-                    send(new_socket, status_buf, ping_bytes, 0);
-#endif
-                    printf("Echoed ping packet to client.\n");
-                }
+        {
+            client_session_t *session = (client_session_t*)malloc(sizeof(client_session_t));
+            if (!session) {
+                fprintf(stderr, "Failed to allocate client session.\n");
+                close_client_socket(new_socket);
+                continue;
             }
-#ifdef _WIN32
-            closesocket(new_socket);
-#else
-            close(new_socket);
-#endif
-        } else if (next_state == 2) {
-            // Wait for Login Start packet (id 0x00)
-            uint8_t login_buf[1024];
-#ifdef _WIN32
-            int login_bytes = recv(new_socket, (char*)login_buf, sizeof(login_buf), 0);
-#else
-            ssize_t login_bytes = recv(new_socket, login_buf, sizeof(login_buf), 0);
-#endif
-            if (login_bytes > 0) {
-                const uint8_t *lptr = login_buf;
-                size_t llen = login_bytes;
-                int32_t lplen = read_varint(&lptr, &llen);
-                int32_t lpid = read_varint(&lptr, &llen);
-                if (lpid == 0x00) {
-                    // Parse username (MC String)
-                    extern char *read_mc_string(const uint8_t **, size_t *);
-                    char *username = read_mc_string(&lptr, &llen);
-                    printf("Login Start: username=%s\n", username);
 
+            memset(session, 0, sizeof(*session));
+            session->socket_fd = new_socket;
+            session->server_fd = server_fd;
+            session->server_config = server_config;
 
-                    // Send Set Compression packet (id 0x03, Login state)
-                    printf("Preparing to send Set Compression...\n");
-                    extern size_t build_set_compression_packet(uint8_t *, size_t, int);
-                    uint8_t comp_buf[16];
-                    size_t comp_buf_len = build_set_compression_packet(
-                        comp_buf,
-                        sizeof(comp_buf),
-                        server_config.compression_threshold);
-                    printf("Set Compression packet (hex): ");
-                    for (size_t i = 0; i < comp_buf_len; ++i) printf("%02X ", comp_buf[i]);
-                    printf("\n");
-
-                    // Send Set Compression with a single frame (not double-framed)
-#ifdef _WIN32
-                    send(new_socket, (const char*)comp_buf, (int)comp_buf_len, 0);
-#else
-                    send(new_socket, comp_buf, comp_buf_len, 0);
-#endif
-                    printf("Sent Set Compression to client.\n");
-
-                    // Add a short delay to ensure client processes Set Compression before Login Success
-#ifdef _WIN32
-                    Sleep(50); // milliseconds
-#else
-                    usleep(50000); // microseconds
-#endif
-
-                    // Send Login Success packet (id 0x02)
-                    printf("Preparing to send Login Success...\n");
-                    // login_finished (id 0x02): Profile = UUID(16) + username + properties[]
-                    uint8_t uuid[16];
-                    extern void write_dummy_uuid(uint8_t *);
-                    write_dummy_uuid(uuid);
-                    printf("Login Success UUID bytes: ");
-                    for (size_t i = 0; i < sizeof(uuid); ++i) printf("%02X ", uuid[i]);
-                    printf("\n");
-
-                    // Encode username as MC String
-                    uint8_t unamebuf[64];
-                    extern size_t write_varint(uint8_t *, int32_t);
-                    size_t uname_len = strlen(username);
-                    size_t uname_varint = write_varint(unamebuf, (int32_t)uname_len);
-                    memcpy(unamebuf + uname_varint, username, uname_len);
-
-                    // Print username encoding for debug
-                    printf("Login Success username (len=%zu): ", uname_len);
-                    for (size_t i = 0; i < uname_varint + uname_len; ++i) printf("%02X ", unamebuf[i]);
-                    printf("\n");
-
-
-                    // Build Login Success packet (raw, no length prefix)
-                    uint8_t packet[128];
-                    size_t offset = 0;
-                    offset += write_varint(packet + offset, 0x02); // Login Success packet id
-                    memcpy(packet + offset, uuid, sizeof(uuid));
-                    offset += sizeof(uuid);
-                    memcpy(packet + offset, unamebuf, uname_varint + uname_len);
-                    offset += uname_varint + uname_len;
-                    // Add properties (VarInt 0 for empty array)
-                    offset += write_varint(packet + offset, 0);
-
-                    // Print raw Login Success packet (no length prefix)
-                    printf("Raw Login Success packet (hex): ");
-                    for (size_t i = 0; i < offset; ++i) printf("%02X ", packet[i]);
-                    printf("\n");
-
-                    // Login Success double-framing (pass only raw packet, no length prefix)
-                    uint8_t double_framed[512];
-                    size_t double_framed_len = double_frame_packet(double_framed, packet, offset);
-                    printf("Double Framed Login Success packet (hex): ");
-                    for (size_t i = 0; i < double_framed_len; ++i) printf("%02X ", double_framed[i]);
-                    printf("\n");
-                    // Send Login Success
-#ifdef _WIN32
-                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                    send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                    printf("Sent Login Success to client.\n");
-
-                    // Wait for Login Acknowledged (0x03) from client
-                    uint8_t ack_buf[256];
-#ifdef _WIN32
-                    int ack_bytes = recv(new_socket, (char*)ack_buf, sizeof(ack_buf), 0);
-#else
-                    ssize_t ack_bytes = recv(new_socket, ack_buf, sizeof(ack_buf), 0);
-#endif
-                    if (ack_bytes > 0) {
-                        printf("Received packet after Login Success: ");
-                        for (int i = 0; i < ack_bytes; ++i) printf("%02X ", ack_buf[i]);
-                        printf("\n");
-                        int32_t ackpid = -1;
-                        if (!read_post_compression_packet_id(ack_buf, (size_t)ack_bytes, &ackpid)) {
-                            printf("Failed to parse packet after Login Success (post-compression format).\n");
-                            free(username);
-#ifdef _WIN32
-                            closesocket(new_socket);
-#else
-                            close(new_socket);
-#endif
-                            continue;
-                        }
-                        printf("Parsed packet ID: %d\n", ackpid);
-                        if (ackpid == 0x03) {
-                            // Send minimal 1.21 configuration packets
-                            extern size_t build_known_packs_packet(uint8_t *, size_t);
-                            extern size_t build_feature_flags_packet(uint8_t *, size_t);
-                            extern size_t build_finish_config_packet(uint8_t *, size_t);
-                            extern size_t build_join_game_packet(uint8_t *, size_t);
-                            extern size_t build_player_pos_packet(uint8_t *, size_t);
-                            config_replay_t replay;
-                            const char *replay_path = NULL;
-                            int have_replay;
-                            uint8_t cfg_buf[1024]; // 1024 to accommodate damage_type (25 entries ~548 bytes)
-                            size_t cfg_len;
-                            uint8_t double_framed[2048];
-                            size_t double_framed_len;
-
-                            // Known Packs (required for proper registry bootstrap in 1.21+)
-                            cfg_len = build_known_packs_packet(cfg_buf, sizeof(cfg_buf));
-                            double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                            send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                            send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                            printf("Sent Known Packs to client.\n");
-
-                            // Wait for Serverbound Known Packs (id 0x07).
-                            int got_known_packs = 0;
-                            for (;;) {
-                                uint8_t kp_buf[1024];
-#ifdef _WIN32
-                                int kp_bytes = recv(new_socket, (char*)kp_buf, sizeof(kp_buf), 0);
-#else
-                                ssize_t kp_bytes = recv(new_socket, kp_buf, sizeof(kp_buf), 0);
-#endif
-                                if (kp_bytes <= 0) {
-                                    break;
-                                }
-
-                                int32_t kp_pid = -1;
-                                if (!read_post_compression_packet_id(kp_buf, (size_t)kp_bytes, &kp_pid)) {
-                                    printf("Failed to parse config packet during known-packs negotiation.\n");
-                                    continue;
-                                }
-                                printf("Parsed config packet ID: %d\n", kp_pid);
-                                if (kp_pid == 0x07) {
-                                    got_known_packs = 1;
-                                    break;
-                                }
-                            }
-
-                            if (!got_known_packs) {
-                                printf("Did not receive Serverbound Known Packs (0x07).\n");
-                                free(username);
-#ifdef _WIN32
-                                closesocket(new_socket);
-#else
-                                close(new_socket);
-#endif
-                                continue;
-                            }
-
-                            have_replay = load_config_replay_with_fallbacks(&replay, &replay_path);
-                            if (have_replay) {
-                                int replay_sent_finish = 0;
-                                printf("Loaded config replay with %zu packets from %s\n", replay.count, replay_path);
-                                for (size_t i = 0; i < replay.count; ++i) {
-                                    int32_t replay_pid;
-                                    const uint8_t *pptr = replay.packets[i];
-                                    size_t plen = replay.lengths[i];
-
-                                    replay_pid = read_varint(&pptr, &plen);
-                                    double_framed_len = double_frame_packet(double_framed, replay.packets[i], replay.lengths[i]);
-#ifdef _WIN32
-                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                    send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                    printf("Sent replay config packet id=%d len=%zu\n", replay_pid, replay.lengths[i]);
-                                    if (replay_pid == 0x03) {
-                                        replay_sent_finish = 1;
-                                    }
-                                }
-
-                                if (!replay_sent_finish) {
-                                    cfg_len = build_finish_config_packet(cfg_buf, sizeof(cfg_buf));
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                    send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                    send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                    printf("Sent Finish Configuration to client.\n");
-                                }
-                            } else {
-                                // Minimal fallback when no replay file is present.
-                                cfg_len = build_feature_flags_packet(cfg_buf, sizeof(cfg_buf));
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Feature Flags to client.\n");
-
-                                cfg_len = build_registry_data_packet(cfg_buf, sizeof(cfg_buf));
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (dimension_type) to client.\n");
-
-                                cfg_len = build_registry_data_biome_packet(cfg_buf, sizeof(cfg_buf));
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (biome) to client.\n");
-
-                                cfg_len = build_registry_data_damage_type(cfg_buf, sizeof(cfg_buf));
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (damage_type) to client.\n");
-
-                                // Required non-empty dynamic registries added in 1.21.5+
-                                cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:cat_variant", "minecraft:tabby");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (cat_variant) to client.\n");
-
-                                cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:chicken_variant", "minecraft:temperate");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (chicken_variant) to client.\n");
-
-                                cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:cow_variant", "minecraft:temperate");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (cow_variant) to client.\n");
-
-                                cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:frog_variant", "minecraft:temperate");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (frog_variant) to client.\n");
-
-                                cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:painting_variant", "minecraft:kebab");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (painting_variant) to client.\n");
-
-                                cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:pig_variant", "minecraft:temperate");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (pig_variant) to client.\n");
-
-                                cfg_len = build_registry_data_inline_empty(cfg_buf, sizeof(cfg_buf), "minecraft:timeline", "minecraft:overworld");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (timeline) to client.\n");
-
-                                cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:wolf_sound_variant", "minecraft:classic");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (wolf_sound_variant) to client.\n");
-
-                                cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:wolf_variant", "minecraft:pale");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (wolf_variant) to client.\n");
-
-                                cfg_len = build_registry_data_with_asset_id(cfg_buf, sizeof(cfg_buf), "minecraft:zombie_nautilus_variant", "minecraft:temperate", "minecraft:zombie_nautilus");
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Registry Data (zombie_nautilus_variant) to client.\n");
-
-                                // Update Tags: bind minecraft:timeline#minecraft:in_overworld to entry 0
-                                cfg_len = build_update_tags_with_timeline(cfg_buf, sizeof(cfg_buf));
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Update Tags to client.\n");
-
-                                cfg_len = build_finish_config_packet(cfg_buf, sizeof(cfg_buf));
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
-#ifdef _WIN32
-                                send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
-#else
-                                send(new_socket, double_framed, double_framed_len, 0);
-#endif
-                                printf("Sent Finish Configuration to client.\n");
-                            }
-
-                            // Wait for Acknowledge Finish Configuration (serverbound id 0x03).
-                            // The client may send other configuration packets first (e.g. plugin/client info).
-                            int got_finish_ack = 0;
-                            for (;;) {
-                                uint8_t cfg_ack_buf[512];
-#ifdef _WIN32
-                                int cfg_ack_bytes = recv(new_socket, (char*)cfg_ack_buf, sizeof(cfg_ack_buf), 0);
-#else
-                                ssize_t cfg_ack_bytes = recv(new_socket, cfg_ack_buf, sizeof(cfg_ack_buf), 0);
-#endif
-                                if (cfg_ack_bytes <= 0) {
-                                    break;
-                                }
-
-                                int32_t cfg_pid = -1;
-                                if (!read_post_compression_packet_id(cfg_ack_buf, (size_t)cfg_ack_bytes, &cfg_pid)) {
-                                    printf("Failed to parse config packet (post-compression format).\n");
-                                    continue;
-                                }
-
-                                printf("Parsed config packet ID: %d\n", cfg_pid);
-                                if (cfg_pid == 0x03) {
-                                    got_finish_ack = 1;
-                                    break;
-                                }
-                            }
-
-                            if (!got_finish_ack) {
-                                free_config_replay(&replay);
-                                printf("Did not receive Acknowledge Finish Configuration (0x03).\n");
-                                free(username);
-#ifdef _WIN32
-                                closesocket(new_socket);
-#else
-                                close(new_socket);
-#endif
-                                continue;
-                            }
-
-                            free_config_replay(&replay);
-
-                            // Load world metadata for play bootstrap if a world folder is available.
-                            world_info_t world_info;
-                            char world_error[256];
-                            int has_world_info = load_world_info(
-                                &world_info,
-                                server_config.world_path,
-                                world_error,
-                                sizeof(world_error));
-
-                            if (has_world_info) {
-                                printf("Loaded world '%s' spawn=(%d,%d,%d) chunk=(%d,%d) chunk_nbt=%s (%zu bytes)\n",
-                                    world_info.world_path,
-                                    world_info.spawn_x,
-                                    world_info.spawn_y,
-                                    world_info.spawn_z,
-                                    world_info.spawn_chunk_x,
-                                    world_info.spawn_chunk_z,
-                                    world_info.has_spawn_chunk ? "yes" : "no",
-                                    world_info.spawn_chunk_nbt_len);
-                            } else {
-                                printf("World data not loaded: %s\n", world_error);
-                            }
-
-                            int force_debug_spawn = server_config.force_debug_spawn || env_flag_enabled("VECTORA_FORCE_DEBUG_SPAWN");
-                            if (force_debug_spawn) {
-                                printf("VECTORA_FORCE_DEBUG_SPAWN enabled: forcing debug chunks and debug spawn.\n");
-                            }
-
-                            // Join Game
-                            uint8_t jg_buf[1024];
-                            join_game_params_t join_params;
-                            memset(&join_params, 0, sizeof(join_params));
-                            join_params.entity_id = 1;
-                            join_params.dimension_name = has_world_info ? world_info.dimension_name : "minecraft:overworld";
-                            join_params.max_players = server_config.max_players;
-                            join_params.view_distance = server_config.view_distance;
-                            join_params.simulation_distance = server_config.simulation_distance;
-                            join_params.previous_game_mode = -1;
-                            join_params.sea_level = has_world_info ? world_info.sea_level : 63;
-                            join_params.is_flat = has_world_info ? world_info.is_flat : 0;
-                            size_t jg_len = build_join_game_packet_ex(jg_buf, sizeof(jg_buf), &join_params);
-                            send_post_compression_packet(new_socket, jg_buf, jg_len);
-                            printf("Sent Join Game to client.\n");
-
-                            if (server_config.send_brand_packet) {
-                                uint8_t brand_buf[256];
-                                size_t brand_len = build_brand_packet(brand_buf, sizeof(brand_buf), server_config.server_brand);
-                                send_post_compression_packet(new_socket, brand_buf, brand_len);
-                                printf("Sent server brand: %s.\n", server_config.server_brand);
-                            }
-
-                            // Game Event type 13: "Start waiting for level chunks"
-                            // Required since 1.20.3 — without it the client never leaves "Loading terrain"
-                            if (server_config.send_wait_for_level_chunks_event) {
-                                uint8_t ge_buf[32];
-                                size_t ge_len = build_game_event_packet(ge_buf, sizeof(ge_buf), 13, 0.0f);
-                                send_post_compression_packet(new_socket, ge_buf, ge_len);
-                                printf("Sent Game Event 13 (Start waiting for level chunks).\n");
-                            }
-
-                            int32_t debug_chunk_x = has_world_info ? world_info.spawn_chunk_x : 0;
-                            int32_t debug_chunk_z = has_world_info ? world_info.spawn_chunk_z : 0;
-                            int32_t debug_spawn_x = debug_chunk_x * 16 + 8;
-                            int32_t debug_spawn_z = debug_chunk_z * 16 + 8;
-                            int32_t debug_spawn_y = 82;
-                            int32_t player_spawn_x = debug_spawn_x;
-                            int32_t player_spawn_y = debug_spawn_y;
-                            int32_t player_spawn_z = debug_spawn_z;
-                            int center_chunk_real = 0;
-                            client_stream_state_t stream_state;
-                            stream_state.chunk_stream_radius = resolve_chunk_stream_radius(&server_config);
-                            stream_state.stream_center_chunk_x = debug_chunk_x;
-                            stream_state.stream_center_chunk_z = debug_chunk_z;
-                            stream_state.force_debug_spawn = force_debug_spawn;
-                            stream_state.has_world_info = has_world_info;
-
-                            // Always send Set Center Chunk so the client knows where to load chunks.
-                            {
-                                int32_t cx = debug_chunk_x;
-                                int32_t cz = debug_chunk_z;
-                                uint8_t center_buf[64];
-                                size_t center_len = build_set_center_chunk_packet(center_buf, sizeof(center_buf), cx, cz);
-                                send_post_compression_packet(new_socket, center_buf, center_len);
-                                printf("Sent Set Center Chunk for (%d,%d).\n", cx, cz);
-                            }
-
-                            // Send an initial chunk area around center so nearby terrain renders reliably.
-                            {
-                                int32_t chunk_x = debug_chunk_x;
-                                int32_t chunk_z = debug_chunk_z;
-
-                                // ChunkBatchStart (0x0C) — no fields
-                                uint8_t cbs_buf[4];
-                                size_t cbs_len = 0;
-                                cbs_len += write_varint(cbs_buf + cbs_len, 0x0C);
-                                send_post_compression_packet(new_socket, cbs_buf, cbs_len);
-
-                                (void)has_world_info;
-
-                                int sent_chunks = 0;
-
-                                for (int dz = -stream_state.chunk_stream_radius; dz <= stream_state.chunk_stream_radius; dz++) {
-                                    for (int dx = -stream_state.chunk_stream_radius; dx <= stream_state.chunk_stream_radius; dx++) {
-                                        int32_t sx = chunk_x + dx;
-                                        int32_t sz = chunk_z + dz;
-                                        int sent_this = 0;
-
-                                        if (!stream_state.force_debug_spawn && server_config.enable_real_chunks && stream_state.has_world_info && world_info.has_spawn_chunk &&
-                                            sx == world_info.spawn_chunk_x && sz == world_info.spawn_chunk_z) {
-                                            size_t real_len = 0;
-                                            uint8_t *real_buf = build_chunk_data_packet(
-                                                world_info.spawn_chunk_nbt,
-                                                world_info.spawn_chunk_nbt_len,
-                                                sx,
-                                                sz,
-                                                &real_len);
-                                            if (real_buf) {
-                                                send_large_post_compression_packet(new_socket, real_buf, real_len);
-                                                sent_chunks++;
-                                                sent_this = 1;
-                                                center_chunk_real = 1;
-                                                if (g_log_chunk_sends) {
-                                                    printf("Sent REAL chunk for (%d,%d), %zu bytes.\n", sx, sz, real_len);
-                                                }
-                                                free(real_buf);
-                                            } else {
-                                                printf("WARNING: failed to build REAL chunk packet (%d,%d), falling back to DEBUG.\n", sx, sz);
-                                            }
-                                        } else if (!stream_state.force_debug_spawn && server_config.enable_real_chunks && stream_state.has_world_info) {
-                                            uint8_t *chunk_nbt = NULL;
-                                            size_t chunk_nbt_len = 0;
-                                            if (load_chunk_nbt_at(&world_info, sx, sz, &chunk_nbt, &chunk_nbt_len)) {
-                                                size_t real_len = 0;
-                                                uint8_t *real_buf = build_chunk_data_packet(
-                                                    chunk_nbt,
-                                                    chunk_nbt_len,
-                                                    sx,
-                                                    sz,
-                                                    &real_len);
-                                                if (real_buf) {
-                                                    send_large_post_compression_packet(new_socket, real_buf, real_len);
-                                                    sent_chunks++;
-                                                    sent_this = 1;
-                                                    if (g_log_chunk_sends) {
-                                                        printf("Sent REAL chunk for (%d,%d), %zu bytes.\n", sx, sz, real_len);
-                                                    }
-                                                    free(real_buf);
-                                                } else {
-                                                    printf("WARNING: failed to build REAL chunk packet (%d,%d), falling back to DEBUG.\n", sx, sz);
-                                                }
-                                                free(chunk_nbt);
-                                            }
-                                        }
-
-                                        if (!sent_this && (stream_state.force_debug_spawn || !server_config.enable_real_chunks || server_config.allow_debug_chunk_fallback)) {
-                                            size_t dbg_len = 0;
-                                            uint8_t *dbg_buf = build_debug_flat_chunk_packet(sx, sz, &dbg_len);
-                                            if (dbg_buf) {
-                                                send_large_post_compression_packet(new_socket, dbg_buf, dbg_len);
-                                                sent_chunks++;
-                                                if (g_log_chunk_sends) {
-                                                    printf("Sent DEBUG flat chunk for (%d,%d), %zu bytes.\n", sx, sz, dbg_len);
-                                                }
-                                                free(dbg_buf);
-                                            } else {
-                                                printf("WARNING: failed to build DEBUG flat chunk packet (%d,%d).\n", sx, sz);
-                                            }
-                                        } else if (!sent_this) {
-                                            printf("WARNING: no chunk sent for (%d,%d) because debug fallback is disabled.\n", sx, sz);
-                                        }
-                                    }
-                                }
-
-                                // ChunkBatchFinished (0x0B)
-                                uint8_t cbf_buf[8];
-                                size_t cbf_len = 0;
-                                cbf_len += write_varint(cbf_buf + cbf_len, 0x0B);
-                                cbf_len += write_varint(cbf_buf + cbf_len, sent_chunks);
-                                send_post_compression_packet(new_socket, cbf_buf, cbf_len);
-                                printf("Sent ChunkBatchFinished (batch size=%d).\n", sent_chunks);
-
-                                if (!force_debug_spawn && server_config.enable_real_chunks && center_chunk_real && has_world_info) {
-                                    int32_t safe_spawn_y = 0;
-                                    int have_safe_spawn = compute_safe_spawn_y_from_chunk_nbt(
-                                        world_info.spawn_chunk_nbt,
-                                        world_info.spawn_chunk_nbt_len,
-                                        world_info.spawn_x,
-                                        world_info.spawn_z,
-                                        &safe_spawn_y);
-
-                                    player_spawn_x = world_info.spawn_x;
-                                    if (have_safe_spawn) {
-                                        player_spawn_y = (safe_spawn_y < 319) ? (safe_spawn_y + 1) : safe_spawn_y;
-                                    } else {
-                                        player_spawn_y = (world_info.spawn_y + 16 > 200) ? (world_info.spawn_y + 16) : 200;
-                                    }
-                                    player_spawn_z = world_info.spawn_z;
-                                    printf("Using real-world spawn at (%d,%d,%d)%s.\n",
-                                           player_spawn_x,
-                                           player_spawn_y,
-                                           player_spawn_z,
-                                           have_safe_spawn ? " from WORLD_SURFACE" : " with high-alt fallback");
-                                } else {
-                                    player_spawn_x = debug_spawn_x;
-                                    player_spawn_y = debug_spawn_y;
-                                    player_spawn_z = debug_spawn_z;
-                                    printf("Using debug spawn at (%d,%d,%d).\n", player_spawn_x, player_spawn_y, player_spawn_z);
-                                }
-                            }
-
-                                                        // Move the client's loading area to the real world spawn chunk when available.
-                            if (has_world_info) {
-                                uint8_t spawn_buf[128];
-                                size_t spawn_len = build_set_default_spawn_packet(
-                                    spawn_buf,
-                                    sizeof(spawn_buf),
-                                    world_info.dimension_name,
-                                    player_spawn_x,
-                                    player_spawn_y,
-                                    player_spawn_z,
-                                    world_info.spawn_yaw,
-                                    world_info.spawn_pitch);
-                                send_post_compression_packet(new_socket, spawn_buf, spawn_len);
-                                printf("Sent Default Spawn Position.\n");
-                            } else {
-                                uint8_t spawn_buf[128];
-                                size_t spawn_len = build_set_default_spawn_packet(
-                                    spawn_buf,
-                                    sizeof(spawn_buf),
-                                    "minecraft:overworld",
-                                    player_spawn_x,
-                                    player_spawn_y,
-                                    player_spawn_z,
-                                    0.0f,
-                                    0.0f);
-                                send_post_compression_packet(new_socket, spawn_buf, spawn_len);
-                                printf("Sent Default Spawn Position fallback.\n");
-                            }
-
-                            {
-                                uint8_t time_buf[64];
-                                size_t time_len = build_update_time_packet(time_buf, sizeof(time_buf), 0, 1000, 1);
-                                send_post_compression_packet(new_socket, time_buf, time_len);
-                                printf("Sent Update Time.\n");
-                            }
-
-                            // Player Position and Look
-                            uint8_t pos_buf[128];
-                            player_pos_params_t pos_params;
-                            memset(&pos_params, 0, sizeof(pos_params));
-                            pos_params.teleport_id = 1;
-                            pos_params.x = (double)player_spawn_x + 0.5;
-                            pos_params.y = (double)player_spawn_y;
-                            pos_params.z = (double)player_spawn_z + 0.5;
-                            pos_params.yaw = (!force_debug_spawn && has_world_info) ? world_info.spawn_yaw : 0.0f;
-                            pos_params.pitch = (!force_debug_spawn && has_world_info) ? world_info.spawn_pitch : 0.0f;
-                            size_t pos_len = build_player_pos_packet_ex(pos_buf, sizeof(pos_buf), &pos_params);
-                            send_post_compression_packet(new_socket, pos_buf, pos_len);
-                            printf("Sent Player Position and Look to client.\n");
-
-                            // Keep the socket open in play state, send Keep Alive every 10s, and log inbound packets.
-#ifdef _WIN32
-                            {
-                                DWORD timeout_ms = 1000;
-                                setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout_ms, sizeof(timeout_ms));
-                            }
-#else
-                            {
-                                struct timeval tv;
-                                tv.tv_sec = 1;
-                                tv.tv_usec = 0;
-                                setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                            }
-#endif
-                            {
-                                int entered_play_state = 1;
-#ifdef _WIN32
-                                u_long listener_nonblock_mode = 1;
-                                ioctlsocket(server_fd, FIONBIO, &listener_nonblock_mode);
-#else
-                                int listener_old_flags = fcntl(server_fd, F_GETFL, 0);
-                                if (listener_old_flags >= 0) {
-                                    fcntl(server_fd, F_SETFL, listener_old_flags | O_NONBLOCK);
-                                }
-#endif
-                                increment_connected_play_sessions();
-                                time_t last_keepalive = time(NULL);
-                                int64_t ka_id = 1;
-                                for (;;) {
-                                    // Keep status ping responsive while a play session is active.
-                                    try_serve_one_pending_status(server_fd, &server_config);
-
-                                    // Send Keep Alive every 10 seconds
-                                    time_t now = time(NULL);
-                                    if (now - last_keepalive >= 10) {
-                                        uint8_t ka_buf[32];
-                                        size_t ka_len = build_keep_alive_packet(ka_buf, sizeof(ka_buf), ka_id++);
-                                        send_post_compression_packet(new_socket, ka_buf, ka_len);
-                                        printf("Sent Keep Alive (id=%lld).\n", (long long)(ka_id - 1));
-                                        last_keepalive = now;
-                                    }
-
-                                    uint8_t play_buf[2048];
-#ifdef _WIN32
-                                    int play_bytes = recv(new_socket, (char*)play_buf, sizeof(play_buf), 0);
-                                    if (play_bytes <= 0) {
-                                        if (WSAGetLastError() == WSAETIMEDOUT) continue;
-                                        break;
-                                    }
-#else
-                                    ssize_t play_bytes = recv(new_socket, play_buf, sizeof(play_buf), 0);
-                                    if (play_bytes <= 0) {
-                                        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                                        break;
-                                    }
-#endif
-                                    {
-                                        int32_t play_pid = -1;
-                                        const uint8_t *play_payload = NULL;
-                                        size_t play_payload_len = 0;
-                                        uint8_t inflate_tmp[8192];
-
-                                        if (read_post_compression_packet_data(
-                                                play_buf,
-                                                (size_t)play_bytes,
-                                                &play_pid,
-                                                &play_payload,
-                                                &play_payload_len,
-                                                inflate_tmp,
-                                                sizeof(inflate_tmp))) {
-                                            if (g_log_play_packets) {
-                                                printf("Play packet ID from client: %d\n", play_pid);
-                                            }
-
-                                            {
-                                                double player_x = 0.0;
-                                                double player_z = 0.0;
-                                                if (try_extract_position_from_play_packet(
-                                                        play_pid,
-                                                        play_payload,
-                                                        play_payload_len,
-                                                        &player_x,
-                                                        &player_z)) {
-                                                    int32_t moved_chunk_x = (int32_t)floor(player_x / 16.0);
-                                                    int32_t moved_chunk_z = (int32_t)floor(player_z / 16.0);
-
-                                                    if (moved_chunk_x != stream_state.stream_center_chunk_x || moved_chunk_z != stream_state.stream_center_chunk_z) {
-                                                        uint8_t center_buf[64];
-                                                        size_t center_len = build_set_center_chunk_packet(
-                                                            center_buf,
-                                                            sizeof(center_buf),
-                                                            moved_chunk_x,
-                                                            moved_chunk_z);
-                                                        send_post_compression_packet(new_socket, center_buf, center_len);
-
-                                                        {
-                                                            uint8_t cbs_buf[4];
-                                                            size_t cbs_len = 0;
-                                                            int sent_chunks = 0;
-                                                            uint8_t cbf_buf[8];
-                                                            size_t cbf_len = 0;
-
-                                                            cbs_len += write_varint(cbs_buf + cbs_len, 0x0C);
-                                                            send_post_compression_packet(new_socket, cbs_buf, cbs_len);
-
-                                                            for (int dz = -stream_state.chunk_stream_radius; dz <= stream_state.chunk_stream_radius; dz++) {
-                                                                for (int dx = -stream_state.chunk_stream_radius; dx <= stream_state.chunk_stream_radius; dx++) {
-                                                                    int32_t sx = moved_chunk_x + dx;
-                                                                    int32_t sz = moved_chunk_z + dz;
-                                                                    int already_loaded =
-                                                                        abs(sx - stream_state.stream_center_chunk_x) <= stream_state.chunk_stream_radius &&
-                                                                        abs(sz - stream_state.stream_center_chunk_z) <= stream_state.chunk_stream_radius;
-
-                                                                    if (already_loaded) {
-                                                                        continue;
-                                                                    }
-
-                                                                    if (send_stream_chunk(new_socket,
-                                                                  sx,
-                                                                  sz,
-                                                                  &server_config,
-                                                                  stream_state.force_debug_spawn,
-                                                                  stream_state.has_world_info,
-                                                                  &world_info)) {
-                                                                        sent_chunks += 1;
-                                                                    }
-                                                                }
-                                                            }
-
-                                                            cbf_len += write_varint(cbf_buf + cbf_len, 0x0B);
-                                                            cbf_len += write_varint(cbf_buf + cbf_len, sent_chunks);
-                                                            send_post_compression_packet(new_socket, cbf_buf, cbf_len);
-                                                        }
-
-                                                        stream_state.stream_center_chunk_x = moved_chunk_x;
-                                                        stream_state.stream_center_chunk_z = moved_chunk_z;
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            if (g_log_packet_framing) {
-                                                printf("Failed to parse play packet in post-compression format.\n");
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if (entered_play_state) {
-                                    decrement_connected_play_sessions();
-                                }
-#ifdef _WIN32
-                                listener_nonblock_mode = 0;
-                                ioctlsocket(server_fd, FIONBIO, &listener_nonblock_mode);
-#else
-                                if (listener_old_flags >= 0) {
-                                    fcntl(server_fd, F_SETFL, listener_old_flags);
-                                }
-#endif
-                            }
-
-                            if (has_world_info) {
-                                free_world_info(&world_info);
-                            }
+            // Increment before spawning thread to avoid race condition
+            increment_active_connections();
 
 #ifdef _WIN32
-                            closesocket(new_socket);
-#else
-                            close(new_socket);
-#endif
-                        } else {
-                            printf("Did not receive Login Acknowledged (got id=%d)\n", ackpid);
-                        }
-                    } else {
-                        printf("No packet received after Login Success.\n");
-                    }
-                    free(username);
+            {
+                HANDLE thread_handle = CreateThread(NULL, 0, client_worker_thread, session, 0, NULL);
+                if (thread_handle == NULL) {
+                    fprintf(stderr, "CreateThread failed for client session.\n");
+                    close_client_socket(new_socket);
+                    free(session);
+                    decrement_active_connections();
+                    continue;
                 }
+                CloseHandle(thread_handle);
             }
-        } else {
-#ifdef _WIN32
-            closesocket(new_socket);
 #else
-            close(new_socket);
+            {
+                pthread_t thread;
+                if (pthread_create(&thread, NULL, client_worker_thread, session) != 0) {
+                    fprintf(stderr, "pthread_create failed for client session.\n");
+                    close_client_socket(new_socket);
+                    free(session);
+                    decrement_active_connections();
+                    continue;
+                }
+                pthread_detach(thread);
+            }
 #endif
         }
     }

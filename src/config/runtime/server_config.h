@@ -12,6 +12,7 @@ enum {
 typedef struct {
     int port;
     int max_players;
+    int max_connections;
     int online_players_mode;
     int online_players_display;
     int protocol_number;
@@ -19,6 +20,8 @@ typedef struct {
     int chunk_stream_radius;
     int view_distance;
     int simulation_distance;
+    int game_mode;
+    int difficulty;
     int force_debug_spawn;
     int enable_real_chunks;
     int allow_debug_chunk_fallback;
@@ -27,6 +30,7 @@ typedef struct {
     int log_packet_framing;
     int log_play_packets;
     int log_chunk_sends;
+    int offline_mode;
     char server_brand[64];
     char protocol_name[64];
     char motd[256];
