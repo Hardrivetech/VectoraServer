@@ -39,7 +39,7 @@ size_t build_join_game_packet_ex(uint8_t *outbuf, size_t outbuf_size, const join
     offset += 4;
 
     // Is hardcore (bool)
-    packet[offset++] = 0x00;
+    packet[offset++] = params != NULL && params->is_hardcore ? 0x01 : 0x00;
 
     // Dimension Names (Prefixed Array of Identifier)
     offset += write_varint(packet + offset, 1);
@@ -69,10 +69,9 @@ size_t build_join_game_packet_ex(uint8_t *outbuf, size_t outbuf_size, const join
     write_u64_be(packet + offset, params != NULL ? params->hashed_seed : 0);
     offset += 8;
 
-    // Game mode (ubyte), Previous game mode (byte), Difficulty (ubyte)
+    // Game mode (ubyte), Previous game mode (byte)
     packet[offset++] = params != NULL ? params->game_mode : 0x00;
     packet[offset++] = (uint8_t)(params != NULL ? params->previous_game_mode : -1);
-    packet[offset++] = params != NULL ? params->difficulty : 0x02;
 
     // Is Debug, Is Flat, Has Death Location
     packet[offset++] = params != NULL && params->is_debug ? 0x01 : 0x00;

@@ -22,6 +22,7 @@ add_executable(Vectora
 	src/config/runtime/server_config.c
 	src/world/storage/world_loader.c
 	src/play/packet/join_game.c
+	src/play/packet/game_rules.c
 	src/play/player/player_position.c
 	src/play/packet/play_packets.c
 	src/play/chunk/chunk_sender.c

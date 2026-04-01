@@ -2,6 +2,7 @@
 #define SERVER_CONFIG_H
 
 #include <stddef.h>
+#include "../../play/packet/game_rules.h"
 
 enum {
     ONLINE_PLAYERS_MODE_FIXED = 0,
@@ -22,6 +23,10 @@ typedef struct {
     int simulation_distance;
     int game_mode;
     int difficulty;
+    int is_hardcore;
+    int pvp_enabled;
+    int spawn_protection_radius;
+    game_rules_t game_rules;
     int force_debug_spawn;
     int enable_real_chunks;
     int allow_debug_chunk_fallback;

@@ -1250,7 +1250,7 @@ static void handle_client_connection(client_session_t *session) {
                                             join_params.view_distance = server_config.view_distance;
                                             join_params.simulation_distance = server_config.simulation_distance;
                                             join_params.game_mode = (uint8_t)server_config.game_mode;
-                                            join_params.difficulty = (uint8_t)server_config.difficulty;
+                                            join_params.is_hardcore = server_config.is_hardcore;
                                             join_params.previous_game_mode = -1;
                                             join_params.sea_level = has_world_info ? world_info.sea_level : 63;
                                             join_params.is_flat = has_world_info ? world_info.is_flat : 0;
@@ -1264,6 +1264,14 @@ static void handle_client_connection(client_session_t *session) {
                                             size_t brand_len = build_brand_packet(brand_buf, sizeof(brand_buf), server_config.server_brand);
                                             send_post_compression_packet(new_socket, brand_buf, brand_len);
                                             printf("Sent server brand: %s.\n", server_config.server_brand);
+                                        }
+
+                                        // Send Game Rules
+                                        {
+                                            uint8_t game_rules_buf[4096];
+                                            size_t game_rules_len = build_game_rules_packet(game_rules_buf, sizeof(game_rules_buf), &server_config.game_rules);
+                                            send_post_compression_packet(new_socket, game_rules_buf, game_rules_len);
+                                            printf("Sent Game Rules packet (%zu bytes).\n", game_rules_len);
                                         }
 
                                         // Game Event type 13: "Start waiting for level chunks"

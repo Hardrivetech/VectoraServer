@@ -186,6 +186,57 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     if (strcmp(key, "difficulty") == 0) {
         return parse_int_in_range(value, 0, 3, &config->difficulty);
     }
+    if (strcmp(key, "is_hardcore") == 0) {
+        return parse_bool_value(value, &config->is_hardcore);
+    }
+    if (strcmp(key, "pvp_enabled") == 0) {
+        return parse_bool_value(value, &config->pvp_enabled);
+    }
+    if (strcmp(key, "spawn_protection_radius") == 0) {
+        return parse_int_in_range(value, 0, 1000, &config->spawn_protection_radius);
+    }
+    if (strcmp(key, "rule_do_daylight_cycle") == 0) {
+        return parse_bool_value(value, &config->game_rules.do_daylight_cycle);
+    }
+    if (strcmp(key, "rule_do_mob_spawning") == 0) {
+        return parse_bool_value(value, &config->game_rules.do_mob_spawning);
+    }
+    if (strcmp(key, "rule_do_fire_tick") == 0) {
+        return parse_bool_value(value, &config->game_rules.do_fire_tick);
+    }
+    if (strcmp(key, "rule_do_environment_damage") == 0) {
+        return parse_bool_value(value, &config->game_rules.do_environment_damage);
+    }
+    if (strcmp(key, "rule_keep_inventory") == 0) {
+        return parse_bool_value(value, &config->game_rules.keep_inventory);
+    }
+    if (strcmp(key, "rule_do_immediate_respawn") == 0) {
+        return parse_bool_value(value, &config->game_rules.do_immediate_respawn);
+    }
+    if (strcmp(key, "rule_show_death_messages") == 0) {
+        return parse_bool_value(value, &config->game_rules.show_death_messages);
+    }
+    if (strcmp(key, "rule_send_command_feedback") == 0) {
+        return parse_bool_value(value, &config->game_rules.send_command_feedback);
+    }
+    if (strcmp(key, "rule_log_admin_commands") == 0) {
+        return parse_bool_value(value, &config->game_rules.log_admin_commands);
+    }
+    if (strcmp(key, "rule_announce_advancements") == 0) {
+        return parse_bool_value(value, &config->game_rules.announce_advancements);
+    }
+    if (strcmp(key, "rule_disable_elytra_movement_check") == 0) {
+        return parse_bool_value(value, &config->game_rules.disable_elytra_movement_check);
+    }
+    if (strcmp(key, "rule_max_command_chain_length") == 0) {
+        return parse_int_in_range(value, 0, 2147483647, &config->game_rules.max_command_chain_length);
+    }
+    if (strcmp(key, "rule_max_entity_cramming") == 0) {
+        return parse_int_in_range(value, 0, 1000, &config->game_rules.max_entity_cramming);
+    }
+    if (strcmp(key, "rule_random_tick_speed") == 0) {
+        return parse_int_in_range(value, 0, 1000, &config->game_rules.random_tick_speed);
+    }
     if (strcmp(key, "server_brand") == 0) {
         return parse_string_value(value, config->server_brand, sizeof(config->server_brand));
     }
@@ -308,6 +359,10 @@ void set_server_config_defaults(server_config_t *config) {
     config->simulation_distance = 10;
     config->game_mode = 0;
     config->difficulty = 2;
+    config->is_hardcore = 0;
+    config->pvp_enabled = 1;
+    config->spawn_protection_radius = 16;
+    get_default_game_rules(&config->game_rules);
     config->force_debug_spawn = 0;
     config->enable_real_chunks = 1;
     config->allow_debug_chunk_fallback = 1;

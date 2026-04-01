@@ -14,7 +14,7 @@ typedef struct {
 	uint64_t hashed_seed;
 	uint8_t game_mode;
 	int8_t previous_game_mode;
-	uint8_t difficulty;
+	int is_hardcore;
 	int is_debug;
 	int is_flat;
 	int portal_cooldown;
