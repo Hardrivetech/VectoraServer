@@ -168,6 +168,9 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     if (strcmp(key, "compression_threshold") == 0) {
         return parse_int_in_range(value, 0, 1048576, &config->compression_threshold);
     }
+    if (strcmp(key, "chunk_stream_radius") == 0) {
+        return parse_int_in_range(value, 0, 12, &config->chunk_stream_radius);
+    }
     if (strcmp(key, "view_distance") == 0) {
         return parse_int_in_range(value, 2, 32, &config->view_distance);
     }
@@ -213,6 +216,10 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     }
     if (strcmp(key, "log_packet_framing") == 0) {
         config->log_packet_framing = parsed;
+        return 1;
+    }
+    if (strcmp(key, "log_play_packets") == 0) {
+        config->log_play_packets = parsed;
         return 1;
     }
     if (strcmp(key, "log_chunk_sends") == 0) {
@@ -282,6 +289,7 @@ void set_server_config_defaults(server_config_t *config) {
     config->online_players_display = 0;
     config->protocol_number = 774;
     config->compression_threshold = 256;
+    config->chunk_stream_radius = 0;
     config->view_distance = 10;
     config->simulation_distance = 10;
     config->force_debug_spawn = 0;
@@ -290,6 +298,7 @@ void set_server_config_defaults(server_config_t *config) {
     config->send_brand_packet = 1;
     config->send_wait_for_level_chunks_event = 1;
     config->log_packet_framing = 1;
+    config->log_play_packets = 0;
     config->log_chunk_sends = 1;
     snprintf(config->server_brand, sizeof(config->server_brand), "%s", "Vectora");
     snprintf(config->protocol_name, sizeof(config->protocol_name), "%s", "Vectora 1.20.x");

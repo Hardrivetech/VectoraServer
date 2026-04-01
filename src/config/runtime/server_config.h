@@ -16,6 +16,7 @@ typedef struct {
     int online_players_display;
     int protocol_number;
     int compression_threshold;
+    int chunk_stream_radius;
     int view_distance;
     int simulation_distance;
     int force_debug_spawn;
@@ -24,6 +25,7 @@ typedef struct {
     int send_brand_packet;
     int send_wait_for_level_chunks_event;
     int log_packet_framing;
+    int log_play_packets;
     int log_chunk_sends;
     char server_brand[64];
     char protocol_name[64];

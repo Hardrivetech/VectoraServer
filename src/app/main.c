@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <math.h>
 #include "protocol.h"
 #include "packet.h"
 #include "configuration_packets.h"
@@ -38,8 +39,213 @@ typedef int socket_handle_t;
 #include <zlib.h>
 static int compression_threshold = 256; // Match Set Compression threshold
 static int g_log_packet_framing = 1;
+static int g_log_play_packets = 0;
 static int g_log_chunk_sends = 1;
-static int g_connected_play_sessions = 0;
+
+#ifdef _WIN32
+static volatile LONG g_connected_play_sessions = 0;
+static int load_connected_play_sessions(void) {
+    return (int)InterlockedCompareExchange(&g_connected_play_sessions, 0, 0);
+}
+static void increment_connected_play_sessions(void) {
+    InterlockedIncrement(&g_connected_play_sessions);
+}
+static void decrement_connected_play_sessions(void) {
+    InterlockedDecrement(&g_connected_play_sessions);
+}
+#else
+static volatile int g_connected_play_sessions = 0;
+static int load_connected_play_sessions(void) {
+    return __sync_add_and_fetch(&g_connected_play_sessions, 0);
+}
+static void increment_connected_play_sessions(void) {
+    __sync_add_and_fetch(&g_connected_play_sessions, 1);
+}
+static void decrement_connected_play_sessions(void) {
+    __sync_sub_and_fetch(&g_connected_play_sessions, 1);
+}
+#endif
+
+typedef struct {
+    int32_t stream_center_chunk_x;
+    int32_t stream_center_chunk_z;
+    int chunk_stream_radius;
+    int force_debug_spawn;
+    int has_world_info;
+} client_stream_state_t;
+
+static void send_large_post_compression_packet(socket_handle_t socket_fd,
+                                               const uint8_t *packet,
+                                               size_t packet_len);
+
+static uint64_t read_be64_ptr(const uint8_t *src) {
+    return ((uint64_t)src[0] << 56) |
+           ((uint64_t)src[1] << 48) |
+           ((uint64_t)src[2] << 40) |
+           ((uint64_t)src[3] << 32) |
+           ((uint64_t)src[4] << 24) |
+           ((uint64_t)src[5] << 16) |
+           ((uint64_t)src[6] << 8) |
+            (uint64_t)src[7];
+}
+
+static double read_be_double_ptr(const uint8_t *src) {
+    union {
+        uint64_t bits;
+        double value;
+    } u;
+    u.bits = read_be64_ptr(src);
+    return u.value;
+}
+
+static int read_post_compression_packet_data(const uint8_t *buf,
+                                             size_t buf_len,
+                                             int32_t *out_packet_id,
+                                             const uint8_t **out_payload,
+                                             size_t *out_payload_len,
+                                             uint8_t *inflate_buf,
+                                             size_t inflate_buf_size) {
+    const uint8_t *p = buf;
+    size_t len = buf_len;
+
+    if (buf == NULL || out_packet_id == NULL || out_payload == NULL || out_payload_len == NULL) {
+        return 0;
+    }
+
+    (void)read_varint(&p, &len);
+    if (len == 0) {
+        return 0;
+    }
+
+    {
+        int32_t data_len = read_varint(&p, &len);
+        if (data_len < 0) {
+            return 0;
+        }
+
+        if (data_len == 0) {
+            const uint8_t *payload_ptr = p;
+            size_t payload_len = len;
+            *out_packet_id = read_varint(&payload_ptr, &payload_len);
+            if ((int)*out_packet_id < 0) {
+                return 0;
+            }
+            *out_payload = payload_ptr;
+            *out_payload_len = payload_len;
+            return 1;
+        }
+    }
+
+    {
+        uLongf inflated_len = (uLongf)inflate_buf_size;
+        int zres = uncompress(inflate_buf, &inflated_len, p, (uLong)len);
+        if (zres != Z_OK || inflated_len == 0) {
+            return 0;
+        }
+
+        {
+            const uint8_t *ip = inflate_buf;
+            size_t ilen = (size_t)inflated_len;
+            *out_packet_id = read_varint(&ip, &ilen);
+            if ((int)*out_packet_id < 0) {
+                return 0;
+            }
+            *out_payload = ip;
+            *out_payload_len = ilen;
+            return 1;
+        }
+    }
+}
+
+static int try_extract_position_from_play_packet(int32_t packet_id,
+                                                 const uint8_t *payload,
+                                                 size_t payload_len,
+                                                 double *out_x,
+                                                 double *out_z) {
+    /*
+     * Accept common serverbound movement packet IDs used across nearby protocol
+     * revisions. Position packets always start with x,y,z doubles.
+     */
+    int is_position_packet =
+        (packet_id == 0x1A) || (packet_id == 0x1B) ||
+        (packet_id == 0x15) || (packet_id == 0x16);
+
+    if (!is_position_packet || payload == NULL || payload_len < 24 || out_x == NULL || out_z == NULL) {
+        return 0;
+    }
+
+    *out_x = read_be_double_ptr(payload);
+    *out_z = read_be_double_ptr(payload + 16);
+    return 1;
+}
+
+static int send_stream_chunk(socket_handle_t socket_fd,
+                             int32_t chunk_x,
+                             int32_t chunk_z,
+                             const server_config_t *server_config,
+                             int force_debug_spawn,
+                             int has_world_info,
+                             const world_info_t *world_info) {
+    int sent_this = 0;
+
+    if (!force_debug_spawn && server_config->enable_real_chunks && has_world_info) {
+        if (world_info->has_spawn_chunk &&
+            chunk_x == world_info->spawn_chunk_x &&
+            chunk_z == world_info->spawn_chunk_z) {
+            size_t real_len = 0;
+            uint8_t *real_buf = build_chunk_data_packet(
+                world_info->spawn_chunk_nbt,
+                world_info->spawn_chunk_nbt_len,
+                chunk_x,
+                chunk_z,
+                &real_len);
+            if (real_buf) {
+                send_large_post_compression_packet(socket_fd, real_buf, real_len);
+                if (g_log_chunk_sends) {
+                    printf("Sent REAL chunk for (%d,%d), %zu bytes.\n", chunk_x, chunk_z, real_len);
+                }
+                free(real_buf);
+                sent_this = 1;
+            }
+        } else {
+            uint8_t *chunk_nbt = NULL;
+            size_t chunk_nbt_len = 0;
+            if (load_chunk_nbt_at(world_info, chunk_x, chunk_z, &chunk_nbt, &chunk_nbt_len)) {
+                size_t real_len = 0;
+                uint8_t *real_buf = build_chunk_data_packet(
+                    chunk_nbt,
+                    chunk_nbt_len,
+                    chunk_x,
+                    chunk_z,
+                    &real_len);
+                if (real_buf) {
+                    send_large_post_compression_packet(socket_fd, real_buf, real_len);
+                    if (g_log_chunk_sends) {
+                        printf("Sent REAL chunk for (%d,%d), %zu bytes.\n", chunk_x, chunk_z, real_len);
+                    }
+                    free(real_buf);
+                    sent_this = 1;
+                }
+                free(chunk_nbt);
+            }
+        }
+    }
+
+    if (!sent_this && (force_debug_spawn || !server_config->enable_real_chunks || server_config->allow_debug_chunk_fallback)) {
+        size_t dbg_len = 0;
+        uint8_t *dbg_buf = build_debug_flat_chunk_packet(chunk_x, chunk_z, &dbg_len);
+        if (dbg_buf) {
+            send_large_post_compression_packet(socket_fd, dbg_buf, dbg_len);
+            if (g_log_chunk_sends) {
+                printf("Sent DEBUG flat chunk for (%d,%d), %zu bytes.\n", chunk_x, chunk_z, dbg_len);
+            }
+            free(dbg_buf);
+            sent_this = 1;
+        }
+    }
+
+    return sent_this;
+}
 
 static int resolve_displayed_online_players(const server_config_t *server_config) {
     int displayed_online_players = server_config->online_players_display;
@@ -47,10 +253,28 @@ static int resolve_displayed_online_players(const server_config_t *server_config
     if (server_config->online_players_mode == ONLINE_PLAYERS_MODE_ZERO) {
         displayed_online_players = 0;
     } else if (server_config->online_players_mode == ONLINE_PLAYERS_MODE_CONNECTED) {
-        displayed_online_players = g_connected_play_sessions;
+        displayed_online_players = load_connected_play_sessions();
     }
 
     return displayed_online_players;
+}
+
+static int resolve_chunk_stream_radius(const server_config_t *server_config) {
+    if (server_config->chunk_stream_radius > 0) {
+        return server_config->chunk_stream_radius;
+    }
+
+    /* Auto mode derives from view_distance but clamps to a safe range. */
+    {
+        int derived = server_config->view_distance;
+        if (derived < 1) {
+            derived = 1;
+        }
+        if (derived > 8) {
+            derived = 8;
+        }
+        return derived;
+    }
 }
 
 static int env_flag_enabled(const char *name) {
@@ -413,6 +637,7 @@ int main() {
 
     compression_threshold = server_config.compression_threshold;
     g_log_packet_framing = server_config.log_packet_framing;
+    g_log_play_packets = server_config.log_play_packets;
     g_log_chunk_sends = server_config.log_chunk_sends;
 
     if (server_config_status > 0) {
@@ -1068,6 +1293,12 @@ int main() {
                             int32_t player_spawn_y = debug_spawn_y;
                             int32_t player_spawn_z = debug_spawn_z;
                             int center_chunk_real = 0;
+                            client_stream_state_t stream_state;
+                            stream_state.chunk_stream_radius = resolve_chunk_stream_radius(&server_config);
+                            stream_state.stream_center_chunk_x = debug_chunk_x;
+                            stream_state.stream_center_chunk_z = debug_chunk_z;
+                            stream_state.force_debug_spawn = force_debug_spawn;
+                            stream_state.has_world_info = has_world_info;
 
                             // Always send Set Center Chunk so the client knows where to load chunks.
                             {
@@ -1079,7 +1310,7 @@ int main() {
                                 printf("Sent Set Center Chunk for (%d,%d).\n", cx, cz);
                             }
 
-                            // Send a 3x3 chunk area so center chunk has neighbors and renders reliably.
+                            // Send an initial chunk area around center so nearby terrain renders reliably.
                             {
                                 int32_t chunk_x = debug_chunk_x;
                                 int32_t chunk_z = debug_chunk_z;
@@ -1094,13 +1325,13 @@ int main() {
 
                                 int sent_chunks = 0;
 
-                                for (int dz = -1; dz <= 1; dz++) {
-                                    for (int dx = -1; dx <= 1; dx++) {
+                                for (int dz = -stream_state.chunk_stream_radius; dz <= stream_state.chunk_stream_radius; dz++) {
+                                    for (int dx = -stream_state.chunk_stream_radius; dx <= stream_state.chunk_stream_radius; dx++) {
                                         int32_t sx = chunk_x + dx;
                                         int32_t sz = chunk_z + dz;
                                         int sent_this = 0;
 
-                                        if (!force_debug_spawn && server_config.enable_real_chunks && has_world_info && world_info.has_spawn_chunk &&
+                                        if (!stream_state.force_debug_spawn && server_config.enable_real_chunks && stream_state.has_world_info && world_info.has_spawn_chunk &&
                                             sx == world_info.spawn_chunk_x && sz == world_info.spawn_chunk_z) {
                                             size_t real_len = 0;
                                             uint8_t *real_buf = build_chunk_data_packet(
@@ -1121,7 +1352,7 @@ int main() {
                                             } else {
                                                 printf("WARNING: failed to build REAL chunk packet (%d,%d), falling back to DEBUG.\n", sx, sz);
                                             }
-                                        } else if (!force_debug_spawn && server_config.enable_real_chunks && has_world_info) {
+                                        } else if (!stream_state.force_debug_spawn && server_config.enable_real_chunks && stream_state.has_world_info) {
                                             uint8_t *chunk_nbt = NULL;
                                             size_t chunk_nbt_len = 0;
                                             if (load_chunk_nbt_at(&world_info, sx, sz, &chunk_nbt, &chunk_nbt_len)) {
@@ -1147,7 +1378,7 @@ int main() {
                                             }
                                         }
 
-                                        if (!sent_this && (force_debug_spawn || !server_config.enable_real_chunks || server_config.allow_debug_chunk_fallback)) {
+                                        if (!sent_this && (stream_state.force_debug_spawn || !server_config.enable_real_chunks || server_config.allow_debug_chunk_fallback)) {
                                             size_t dbg_len = 0;
                                             uint8_t *dbg_buf = build_debug_flat_chunk_packet(sx, sz, &dbg_len);
                                             if (dbg_buf) {
@@ -1278,7 +1509,7 @@ int main() {
                                     fcntl(server_fd, F_SETFL, listener_old_flags | O_NONBLOCK);
                                 }
 #endif
-                                g_connected_play_sessions += 1;
+                                increment_connected_play_sessions();
                                 time_t last_keepalive = time(NULL);
                                 int64_t ka_id = 1;
                                 for (;;) {
@@ -1311,8 +1542,87 @@ int main() {
 #endif
                                     {
                                         int32_t play_pid = -1;
-                                        if (read_post_compression_packet_id(play_buf, (size_t)play_bytes, &play_pid)) {
-                                            (void)play_pid;
+                                        const uint8_t *play_payload = NULL;
+                                        size_t play_payload_len = 0;
+                                        uint8_t inflate_tmp[8192];
+
+                                        if (read_post_compression_packet_data(
+                                                play_buf,
+                                                (size_t)play_bytes,
+                                                &play_pid,
+                                                &play_payload,
+                                                &play_payload_len,
+                                                inflate_tmp,
+                                                sizeof(inflate_tmp))) {
+                                            if (g_log_play_packets) {
+                                                printf("Play packet ID from client: %d\n", play_pid);
+                                            }
+
+                                            {
+                                                double player_x = 0.0;
+                                                double player_z = 0.0;
+                                                if (try_extract_position_from_play_packet(
+                                                        play_pid,
+                                                        play_payload,
+                                                        play_payload_len,
+                                                        &player_x,
+                                                        &player_z)) {
+                                                    int32_t moved_chunk_x = (int32_t)floor(player_x / 16.0);
+                                                    int32_t moved_chunk_z = (int32_t)floor(player_z / 16.0);
+
+                                                    if (moved_chunk_x != stream_state.stream_center_chunk_x || moved_chunk_z != stream_state.stream_center_chunk_z) {
+                                                        uint8_t center_buf[64];
+                                                        size_t center_len = build_set_center_chunk_packet(
+                                                            center_buf,
+                                                            sizeof(center_buf),
+                                                            moved_chunk_x,
+                                                            moved_chunk_z);
+                                                        send_post_compression_packet(new_socket, center_buf, center_len);
+
+                                                        {
+                                                            uint8_t cbs_buf[4];
+                                                            size_t cbs_len = 0;
+                                                            int sent_chunks = 0;
+                                                            uint8_t cbf_buf[8];
+                                                            size_t cbf_len = 0;
+
+                                                            cbs_len += write_varint(cbs_buf + cbs_len, 0x0C);
+                                                            send_post_compression_packet(new_socket, cbs_buf, cbs_len);
+
+                                                            for (int dz = -stream_state.chunk_stream_radius; dz <= stream_state.chunk_stream_radius; dz++) {
+                                                                for (int dx = -stream_state.chunk_stream_radius; dx <= stream_state.chunk_stream_radius; dx++) {
+                                                                    int32_t sx = moved_chunk_x + dx;
+                                                                    int32_t sz = moved_chunk_z + dz;
+                                                                    int already_loaded =
+                                                                        abs(sx - stream_state.stream_center_chunk_x) <= stream_state.chunk_stream_radius &&
+                                                                        abs(sz - stream_state.stream_center_chunk_z) <= stream_state.chunk_stream_radius;
+
+                                                                    if (already_loaded) {
+                                                                        continue;
+                                                                    }
+
+                                                                    if (send_stream_chunk(new_socket,
+                                                                  sx,
+                                                                  sz,
+                                                                  &server_config,
+                                                                  stream_state.force_debug_spawn,
+                                                                  stream_state.has_world_info,
+                                                                  &world_info)) {
+                                                                        sent_chunks += 1;
+                                                                    }
+                                                                }
+                                                            }
+
+                                                            cbf_len += write_varint(cbf_buf + cbf_len, 0x0B);
+                                                            cbf_len += write_varint(cbf_buf + cbf_len, sent_chunks);
+                                                            send_post_compression_packet(new_socket, cbf_buf, cbf_len);
+                                                        }
+
+                                                        stream_state.stream_center_chunk_x = moved_chunk_x;
+                                                        stream_state.stream_center_chunk_z = moved_chunk_z;
+                                                    }
+                                                }
+                                            }
                                         } else {
                                             if (g_log_packet_framing) {
                                                 printf("Failed to parse play packet in post-compression format.\n");
@@ -1322,7 +1632,7 @@ int main() {
                                 }
 
                                 if (entered_play_state) {
-                                    g_connected_play_sessions -= 1;
+                                    decrement_connected_play_sessions();
                                 }
 #ifdef _WIN32
                                 listener_nonblock_mode = 0;
