@@ -10,4 +10,4 @@ else()
 	set(VECTORA_ICON)
 endif()
 
-add_executable(Vectora src/main.c src/protocol.c src/util.c src/packet.c src/status.c src/uuid_util.c src/join_game.c src/player_pos.c src/config_packets.c src/config_replay.c src/world_loader.c src/play_packets.c ${VECTORA_ICON})
+add_executable(Vectora src/main.c src/protocol.c src/util.c src/packet.c src/status.c src/uuid_util.c src/join_game.c src/player_pos.c src/config_packets.c src/config_replay.c src/world_loader.c src/play_packets.c src/chunk_sender.c ${VECTORA_ICON})

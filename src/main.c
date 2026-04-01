@@ -11,6 +11,7 @@
 #include "player_pos.h"
 #include "play_packets.h"
 #include "world_loader.h"
+#include "chunk_sender.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -179,6 +180,53 @@ static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_
 #else
     send(socket_fd, framed, framed_len, 0);
 #endif
+}
+
+// Large-packet version that uses heap allocation for packets that don't fit in
+// the fixed-size framed[] stack buffer.
+static void send_large_post_compression_packet(socket_handle_t socket_fd,
+                                                const uint8_t *packet,
+                                                size_t packet_len) {
+    uint8_t outer_vi[5], inner_vi[5];
+    size_t  outer_vi_len, inner_vi_len;
+    uint8_t *frame = NULL;
+    size_t   frame_len;
+
+    if ((int)packet_len >= compression_threshold) {
+        uLongf comp_bound = compressBound((uLong)packet_len);
+        uint8_t *comp = (uint8_t *)malloc(comp_bound);
+        if (!comp) return;
+        if (compress2(comp, &comp_bound, packet, (uLong)packet_len,
+                      Z_DEFAULT_COMPRESSION) != Z_OK) {
+            free(comp);
+            return;
+        }
+        inner_vi_len = write_varint(inner_vi, (int32_t)packet_len);
+        size_t inner_len = inner_vi_len + comp_bound;
+        outer_vi_len = write_varint(outer_vi, (int32_t)inner_len);
+        frame_len = outer_vi_len + inner_len;
+        frame = (uint8_t *)malloc(frame_len);
+        if (!frame) { free(comp); return; }
+        memcpy(frame, outer_vi, outer_vi_len);
+        memcpy(frame + outer_vi_len, inner_vi, inner_vi_len);
+        memcpy(frame + outer_vi_len + inner_vi_len, comp, comp_bound);
+        free(comp);
+    } else {
+        outer_vi_len = write_varint(outer_vi, (int32_t)(1 + packet_len));
+        frame_len = outer_vi_len + 1 + packet_len;
+        frame = (uint8_t *)malloc(frame_len);
+        if (!frame) return;
+        memcpy(frame, outer_vi, outer_vi_len);
+        frame[outer_vi_len] = 0x00;
+        memcpy(frame + outer_vi_len + 1, packet, packet_len);
+    }
+
+#ifdef _WIN32
+    send(socket_fd, (const char *)frame, (int)frame_len, 0);
+#else
+    send(socket_fd, frame, frame_len, 0);
+#endif
+    free(frame);
 }
 
 int main() {
@@ -813,6 +861,43 @@ int main() {
                             }
 
                             // Move the client's loading area to the real world spawn chunk when available.
+                                                        // Send the spawn chunk data so the client renders ground instead of void.
+                                                        if (has_world_info && world_info.has_spawn_chunk) {
+                                                            // ChunkBatchStart (0x0C) — no fields
+                                                            uint8_t cbs_buf[4];
+                                                            size_t cbs_len = 0;
+                                                            cbs_len += write_varint(cbs_buf + cbs_len, 0x0C);
+                                                            send_post_compression_packet(new_socket, cbs_buf, cbs_len);
+
+                                                            // ChunkData (0x2C)
+                                                            size_t cd_len = 0;
+                                                            uint8_t *cd_buf = build_chunk_data_packet(
+                                                                world_info.spawn_chunk_nbt,
+                                                                world_info.spawn_chunk_nbt_len,
+                                                                world_info.spawn_chunk_x,
+                                                                world_info.spawn_chunk_z,
+                                                                &cd_len);
+                                                            if (cd_buf) {
+                                                                send_large_post_compression_packet(new_socket, cd_buf, cd_len);
+                                                                printf("Sent chunk data for (%d,%d), %zu bytes.\n",
+                                                                       world_info.spawn_chunk_x,
+                                                                       world_info.spawn_chunk_z,
+                                                                       cd_len);
+                                                                free(cd_buf);
+                                                            } else {
+                                                                printf("WARNING: failed to build chunk data packet.\n");
+                                                            }
+
+                                                            // ChunkBatchFinished (0x0B) — batch size = 1
+                                                            uint8_t cbf_buf[8];
+                                                            size_t cbf_len = 0;
+                                                            cbf_len += write_varint(cbf_buf + cbf_len, 0x0B);
+                                                            cbf_len += write_varint(cbf_buf + cbf_len, 1);
+                                                            send_post_compression_packet(new_socket, cbf_buf, cbf_len);
+                                                            printf("Sent ChunkBatchFinished.\n");
+                                                        }
+
+                                                        // Move the client's loading area to the real world spawn chunk when available.
                             if (has_world_info) {
                                 uint8_t spawn_buf[128];
                                 size_t spawn_len = build_set_default_spawn_packet(
@@ -943,3 +1028,4 @@ static size_t frame_packet(uint8_t *dst, const uint8_t *src, size_t len) {
     memcpy(dst + off, src, len);
     return off + len;
 }
+
