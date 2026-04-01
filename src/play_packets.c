@@ -100,3 +100,29 @@ size_t build_keep_alive_packet(uint8_t *outbuf, size_t outbuf_size, int64_t keep
     offset += 8;
     return offset;
 }
+
+size_t build_brand_packet(uint8_t *outbuf, size_t outbuf_size, const char *brand_name) {
+    size_t offset = 0;
+    const char *channel = "minecraft:brand";
+    size_t channel_len = strlen(channel);
+    size_t brand_len = brand_name ? strlen(brand_name) : 0;
+
+    (void)outbuf_size;
+
+    /* Clientbound Plugin Message (play) */
+    offset += write_varint(outbuf + offset, 0x18);
+
+    /* Channel identifier */
+    offset += write_varint(outbuf + offset, (int32_t)channel_len);
+    memcpy(outbuf + offset, channel, channel_len);
+    offset += channel_len;
+
+    /* Payload for minecraft:brand is a String */
+    offset += write_varint(outbuf + offset, (int32_t)brand_len);
+    if (brand_len > 0) {
+        memcpy(outbuf + offset, brand_name, brand_len);
+        offset += brand_len;
+    }
+
+    return offset;
+}

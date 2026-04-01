@@ -9,5 +9,6 @@ size_t build_set_default_spawn_packet(uint8_t *outbuf, size_t outbuf_size, const
 size_t build_update_time_packet(uint8_t *outbuf, size_t outbuf_size, int64_t world_age, int64_t time_of_day, int increasing);
 size_t build_game_event_packet(uint8_t *outbuf, size_t outbuf_size, uint8_t event_id, float value);
 size_t build_keep_alive_packet(uint8_t *outbuf, size_t outbuf_size, int64_t keep_alive_id);
+size_t build_brand_packet(uint8_t *outbuf, size_t outbuf_size, const char *brand_name);
 
 #endif

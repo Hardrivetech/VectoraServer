@@ -849,6 +849,13 @@ int main() {
                             send_post_compression_packet(new_socket, jg_buf, jg_len);
                             printf("Sent Join Game to client.\n");
 
+                            {
+                                uint8_t brand_buf[256];
+                                size_t brand_len = build_brand_packet(brand_buf, sizeof(brand_buf), "Vectora");
+                                send_post_compression_packet(new_socket, brand_buf, brand_len);
+                                printf("Sent server brand: Vectora.\n");
+                            }
+
                             // Game Event type 13: "Start waiting for level chunks"
                             // Required since 1.20.3 — without it the client never leaves "Loading terrain"
                             {
@@ -858,75 +865,62 @@ int main() {
                                 printf("Sent Game Event 13 (Start waiting for level chunks).\n");
                             }
 
+                            int32_t debug_chunk_x = has_world_info ? world_info.spawn_chunk_x : 0;
+                            int32_t debug_chunk_z = has_world_info ? world_info.spawn_chunk_z : 0;
+                            int32_t debug_spawn_x = debug_chunk_x * 16 + 8;
+                            int32_t debug_spawn_z = debug_chunk_z * 16 + 8;
+                            int32_t debug_spawn_y = 82;
+
                             // Always send Set Center Chunk so the client knows where to load chunks.
                             {
-                                int32_t cx = has_world_info ? world_info.spawn_chunk_x : 0;
-                                int32_t cz = has_world_info ? world_info.spawn_chunk_z : 0;
+                                int32_t cx = debug_chunk_x;
+                                int32_t cz = debug_chunk_z;
                                 uint8_t center_buf[64];
                                 size_t center_len = build_set_center_chunk_packet(center_buf, sizeof(center_buf), cx, cz);
                                 send_post_compression_packet(new_socket, center_buf, center_len);
                                 printf("Sent Set Center Chunk for (%d,%d).\n", cx, cz);
                             }
 
-                            // Move the client's loading area to the real world spawn chunk when available.
-                                                        // Send the spawn chunk data so the client renders ground instead of void.
-                                                        if (has_world_info && world_info.has_spawn_chunk) {
-                                                            // ChunkBatchStart (0x0C) — no fields
-                                                            uint8_t cbs_buf[4];
-                                                            size_t cbs_len = 0;
-                                                            cbs_len += write_varint(cbs_buf + cbs_len, 0x0C);
-                                                            send_post_compression_packet(new_socket, cbs_buf, cbs_len);
+                            // Send a 3x3 chunk area so center chunk has neighbors and renders reliably.
+                            {
+                                int32_t chunk_x = debug_chunk_x;
+                                int32_t chunk_z = debug_chunk_z;
 
-                                                            // ChunkData (0x2C)
-                                                            size_t cd_len = 0;
-                                                            uint8_t *cd_buf = build_chunk_data_packet(
-                                                                world_info.spawn_chunk_nbt,
-                                                                world_info.spawn_chunk_nbt_len,
-                                                                world_info.spawn_chunk_x,
-                                                                world_info.spawn_chunk_z,
-                                                                &cd_len);
-                                                            if (cd_buf) {
-                                                                send_large_post_compression_packet(new_socket, cd_buf, cd_len);
-                                                                printf("Sent chunk data for (%d,%d), %zu bytes.\n",
-                                                                       world_info.spawn_chunk_x,
-                                                                       world_info.spawn_chunk_z,
-                                                                       cd_len);
-                                                                free(cd_buf);
-                                                            } else {
-                                                                printf("WARNING: failed to build chunk data packet.\n");
-                                                            }
+                                // ChunkBatchStart (0x0C) — no fields
+                                uint8_t cbs_buf[4];
+                                size_t cbs_len = 0;
+                                cbs_len += write_varint(cbs_buf + cbs_len, 0x0C);
+                                send_post_compression_packet(new_socket, cbs_buf, cbs_len);
 
-                                                            /*
-                                                             * Diagnostic safety net: overwrite the same chunk with
-                                                             * a synthetic flat debug chunk so we can prove chunk
-                                                             * transport/state is correct even if NBT conversion fails.
-                                                             */
-                                                            {
-                                                                size_t dbg_len = 0;
-                                                                uint8_t *dbg_buf = build_debug_flat_chunk_packet(
-                                                                    world_info.spawn_chunk_x,
-                                                                    world_info.spawn_chunk_z,
-                                                                    &dbg_len);
-                                                                if (dbg_buf) {
-                                                                    send_large_post_compression_packet(new_socket, dbg_buf, dbg_len);
-                                                                    printf("Sent DEBUG flat chunk for (%d,%d), %zu bytes.\n",
-                                                                           world_info.spawn_chunk_x,
-                                                                           world_info.spawn_chunk_z,
-                                                                           dbg_len);
-                                                                    free(dbg_buf);
-                                                                } else {
-                                                                    printf("WARNING: failed to build DEBUG flat chunk packet.\n");
-                                                                }
-                                                            }
+                                (void)has_world_info;
 
-                                                            // ChunkBatchFinished (0x0B) — batch size = 1
-                                                            uint8_t cbf_buf[8];
-                                                            size_t cbf_len = 0;
-                                                            cbf_len += write_varint(cbf_buf + cbf_len, 0x0B);
-                                                            cbf_len += write_varint(cbf_buf + cbf_len, 1);
-                                                            send_post_compression_packet(new_socket, cbf_buf, cbf_len);
-                                                            printf("Sent ChunkBatchFinished.\n");
-                                                        }
+                                int sent_chunks = 0;
+
+                                for (int dz = -1; dz <= 1; dz++) {
+                                    for (int dx = -1; dx <= 1; dx++) {
+                                        int32_t sx = chunk_x + dx;
+                                        int32_t sz = chunk_z + dz;
+                                        size_t dbg_len = 0;
+                                        uint8_t *dbg_buf = build_debug_flat_chunk_packet(sx, sz, &dbg_len);
+                                        if (dbg_buf) {
+                                            send_large_post_compression_packet(new_socket, dbg_buf, dbg_len);
+                                            sent_chunks++;
+                                            printf("Sent DEBUG flat chunk for (%d,%d), %zu bytes.\n", sx, sz, dbg_len);
+                                            free(dbg_buf);
+                                        } else {
+                                            printf("WARNING: failed to build DEBUG flat chunk packet (%d,%d).\n", sx, sz);
+                                        }
+                                    }
+                                }
+
+                                // ChunkBatchFinished (0x0B)
+                                uint8_t cbf_buf[8];
+                                size_t cbf_len = 0;
+                                cbf_len += write_varint(cbf_buf + cbf_len, 0x0B);
+                                cbf_len += write_varint(cbf_buf + cbf_len, sent_chunks);
+                                send_post_compression_packet(new_socket, cbf_buf, cbf_len);
+                                printf("Sent ChunkBatchFinished (batch size=%d).\n", sent_chunks);
+                            }
 
                                                         // Move the client's loading area to the real world spawn chunk when available.
                             if (has_world_info) {
@@ -935,13 +929,26 @@ int main() {
                                     spawn_buf,
                                     sizeof(spawn_buf),
                                     world_info.dimension_name,
-                                    world_info.spawn_x,
-                                    world_info.spawn_y,
-                                    world_info.spawn_z,
+                                    debug_spawn_x,
+                                    debug_spawn_y,
+                                    debug_spawn_z,
                                     world_info.spawn_yaw,
                                     world_info.spawn_pitch);
                                 send_post_compression_packet(new_socket, spawn_buf, spawn_len);
                                 printf("Sent Default Spawn Position.\n");
+                            } else {
+                                uint8_t spawn_buf[128];
+                                size_t spawn_len = build_set_default_spawn_packet(
+                                    spawn_buf,
+                                    sizeof(spawn_buf),
+                                    "minecraft:overworld",
+                                    debug_spawn_x,
+                                    debug_spawn_y,
+                                    debug_spawn_z,
+                                    0.0f,
+                                    0.0f);
+                                send_post_compression_packet(new_socket, spawn_buf, spawn_len);
+                                printf("Sent Default Spawn Position fallback.\n");
                             }
 
                             {
@@ -956,9 +963,9 @@ int main() {
                             player_pos_params_t pos_params;
                             memset(&pos_params, 0, sizeof(pos_params));
                             pos_params.teleport_id = 1;
-                            pos_params.x = has_world_info ? (double)world_info.spawn_x + 0.5 : 0.0;
-                            pos_params.y = has_world_info ? (double)world_info.spawn_y : 64.0;
-                            pos_params.z = has_world_info ? (double)world_info.spawn_z + 0.5 : 0.0;
+                            pos_params.x = (double)debug_spawn_x + 0.5;
+                            pos_params.y = (double)debug_spawn_y;
+                            pos_params.z = (double)debug_spawn_z + 0.5;
                             pos_params.yaw = has_world_info ? world_info.spawn_yaw : 0.0f;
                             pos_params.pitch = has_world_info ? world_info.spawn_pitch : 0.0f;
                             size_t pos_len = build_player_pos_packet_ex(pos_buf, sizeof(pos_buf), &pos_params);

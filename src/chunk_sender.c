@@ -463,14 +463,12 @@ static int write_bs_container(dynbuf_t *b, const section_bs_t *bs) {
     if (bs->palette_size <= 0) {
         /* empty/invalid — single-value air */
         if (!db_u8(b, 0)) return 0;
-        if (!db_varint(b, 0)) return 0;
         return db_varint(b, 0);
     }
     if (bs->palette_size == 1) {
         /* Single-value container */
         if (!db_u8(b, 0)) return 0;
-        if (!db_varint(b, bs->global_ids[0])) return 0;
-        return db_varint(b, 0);
+        return db_varint(b, bs->global_ids[0]);
     }
     /* Indirect palette */
     int bits = ceil_log2_i(bs->palette_size);
@@ -479,15 +477,13 @@ static int write_bs_container(dynbuf_t *b, const section_bs_t *bs) {
         /* Direct format required (>256 palette entries — very rare):
          * fall back to single-value stone for safety */
         if (!db_u8(b, 0)) return 0;
-        if (!db_varint(b, 1)) return 0; /* stone */
-        return db_varint(b, 0);
+        return db_varint(b, 1); /* stone */
     }
     if (!db_u8(b, (uint8_t)bits)) return 0;
     if (!db_varint(b, bs->palette_size)) return 0;
     for (int i = 0; i < bs->palette_size; i++) {
         if (!db_varint(b, bs->global_ids[i])) return 0;
     }
-    if (!db_varint(b, (int32_t)bs->data_count)) return 0;
     if (bs->data_count > 0 && bs->data_ptr) {
         if (!db_bytes(b, bs->data_ptr, (size_t)bs->data_count * 8)) return 0;
     }
@@ -564,39 +560,36 @@ static uint16_t section_non_air_count(const section_bs_t *bs) {
 /* Single-value biome container — always plains (ID 0) */
 static int write_biome_container(dynbuf_t *b) {
     if (!db_u8(b, 0)) return 0;     /* bits per entry = 0 */
-    if (!db_varint(b, 0)) return 0; /* biome ID 0 (plains) */
-    return db_varint(b, 0);         /* data array length = 0 */
+    return db_varint(b, 0);         /* biome ID 0 (plains) */
 }
 
 /* =========================================================================
- * Serialize the NBT Heightmaps field (network NBT format)
+ * Serialize Heightmaps (1.21.5+): Prefixed Array of Heightmap
  * ========================================================================= */
-static int write_heightmaps_nbt(dynbuf_t *b,
-                                 const hm_array_t *motion,
-                                 const hm_array_t *surface) {
-    /* Network NBT: type byte + 2-byte empty name length + compound contents */
-    if (!db_u8(b, 10)) return 0;  /* TAG_Compound */
-    if (!db_be16(b, 0)) return 0; /* empty root name */
+static int write_heightmaps(dynbuf_t *b,
+                            const hm_array_t *motion,
+                            const hm_array_t *surface) {
+    int count = 0;
+    if (surface && surface->ptr && surface->count > 0) count++;
+    if (motion  && motion->ptr  && motion->count  > 0) count++;
 
-    /* Helper to write one TAG_Long_Array entry */
-    #define WRITE_HM(nm, arr)                                              \
-        do {                                                                \
-            if ((arr)->ptr && (arr)->count > 0) {                          \
-                uint16_t nlen = (uint16_t)strlen(nm);                      \
-                if (!db_u8(b, 12)) return 0;   /* TAG_Long_Array */        \
-                if (!db_be16(b, nlen)) return 0;                           \
-                if (!db_bytes(b, (const uint8_t *)(nm), nlen)) return 0;   \
-                if (!db_be32(b, (arr)->count)) return 0;                   \
-                if (!db_bytes(b, (arr)->ptr, (arr)->count * 8)) return 0;  \
-            }                                                               \
-        } while (0)
+    if (!db_varint(b, count)) return 0;
 
-    WRITE_HM("MOTION_BLOCKING", motion);
-    WRITE_HM("WORLD_SURFACE",   surface);
+    /* WORLD_SURFACE */
+    if (surface && surface->ptr && surface->count > 0) {
+        if (!db_varint(b, 1)) return 0;
+        if (!db_varint(b, (int32_t)surface->count)) return 0;
+        if (!db_bytes(b, surface->ptr, (size_t)surface->count * 8)) return 0;
+    }
 
-    #undef WRITE_HM
+    /* MOTION_BLOCKING */
+    if (motion && motion->ptr && motion->count > 0) {
+        if (!db_varint(b, 4)) return 0;
+        if (!db_varint(b, (int32_t)motion->count)) return 0;
+        if (!db_bytes(b, motion->ptr, (size_t)motion->count * 8)) return 0;
+    }
 
-    return db_u8(b, 0); /* TAG_End */
+    return 1;
 }
 
 /* =========================================================================
@@ -609,42 +602,40 @@ static int write_heightmaps_nbt(dynbuf_t *b,
 #define LIGHT_MASK     ((uint64_t)0x3FFFFFF) /* bits 0-25 set */
 
 static int write_light_data(dynbuf_t *b) {
-    static const uint8_t FULL_SKY[2048] = {0}; /* initialised below */
     static uint8_t sky_init = 0;
     static uint8_t FULL_SKY_FF[2048];
 
     if (!sky_init) {
-        memset(FULL_SKY_FF, 0xFF, 2048);
+        memset(FULL_SKY_FF, 0xFF, sizeof(FULL_SKY_FF));
         sky_init = 1;
     }
 
-    /* Sky Light Mask: all 26 sections have sky light */
-    if (!db_varint(b, 1)) return 0; /* 1 long */
+    /* Sky Light Mask: all 26 sections have sky light arrays */
+    if (!db_varint(b, 1)) return 0;
     if (!db_be64(b, LIGHT_MASK)) return 0;
 
     /* Block Light Mask: 0 (no block light arrays) */
     if (!db_varint(b, 1)) return 0;
     if (!db_be64(b, 0)) return 0;
 
-    /* Empty Sky Light Mask: 0 (because we provide sky light for all) */
+    /* Empty Sky Light Mask: 0 (we provide data for all sections) */
     if (!db_varint(b, 1)) return 0;
     if (!db_be64(b, 0)) return 0;
 
-    /* Empty Block Light Mask: all 26 sections have empty block light */
+    /* Empty Block Light Mask: all sections are empty block-light */
     if (!db_varint(b, 1)) return 0;
     if (!db_be64(b, LIGHT_MASK)) return 0;
 
-    /* Sky Light Arrays: 26 × 2048 bytes of 0xFF */
+    /* Sky Light Arrays: 26 x 2048 bytes of 0xFF */
     if (!db_varint(b, LIGHT_SECTIONS)) return 0;
     for (int i = 0; i < LIGHT_SECTIONS; i++) {
         if (!db_varint(b, 2048)) return 0;
         if (!db_bytes(b, FULL_SKY_FF, 2048)) return 0;
     }
 
-    /* Block Light Arrays: 0 */
+    /* Block Light Arrays: 0 entries */
     if (!db_varint(b, 0)) return 0;
 
-    (void)FULL_SKY; /* suppress unused warning */
     return 1;
 }
 
@@ -789,8 +780,15 @@ build:;
     if (!db_be32(&b, (uint32_t)chunk_x)) goto fail;
     if (!db_be32(&b, (uint32_t)chunk_z)) goto fail;
 
-    /* Heightmaps NBT */
-    if (!write_heightmaps_nbt(&b, &hm_motion, &hm_surface)) goto fail;
+    /*
+     * Use fixed-size zeroed heightmaps (37 longs each) to avoid malformed
+     * heightmap extraction from chunk NBT causing client decode failures.
+     */
+    {
+        static uint8_t hm_zero[37 * 8] = {0};
+        hm_array_t hm_safe = {hm_zero, 37};
+        if (!write_heightmaps(&b, &hm_safe, &hm_safe)) goto fail;
+    }
 
     /* --- Sections data (VarInt-prefixed byte array) --- */
     /* Reserve space for the VarInt length prefix (up to 5 bytes) */
@@ -809,9 +807,8 @@ build:;
         if (sec->valid) {
             if (!write_bs_container(&b, &sec->bs)) goto fail;
         } else {
-            /* empty section: single-value air */
+            /* empty section: single-value air — BPE=0, value=0, no data array */
             if (!db_u8(&b, 0)) goto fail;
-            if (!db_varint(&b, 0)) goto fail;
             if (!db_varint(&b, 0)) goto fail;
         }
         /* biomes: single-value plains (0) */
@@ -864,10 +861,11 @@ uint8_t *build_debug_flat_chunk_packet(int32_t chunk_x, int32_t chunk_z,
     if (!db_be32(&b, (uint32_t)chunk_x)) goto fail;
     if (!db_be32(&b, (uint32_t)chunk_z)) goto fail;
 
-    /* Empty Heightmaps compound */
+    /* Valid zeroed heightmaps (37 longs each). */
     {
-        hm_array_t none = {NULL, 0};
-        if (!write_heightmaps_nbt(&b, &none, &none)) goto fail;
+        static uint8_t hm_zero[37 * 8] = {0};
+        hm_array_t hm_safe = {hm_zero, 37};
+        if (!write_heightmaps(&b, &hm_safe, &hm_safe)) goto fail;
     }
 
     /* Sections data */
@@ -882,15 +880,13 @@ uint8_t *build_debug_flat_chunk_packet(int32_t chunk_x, int32_t chunk_z,
     for (int i = 0; i < NUM_SECTIONS; i++) {
         if (i == stone_section_idx) {
             if (!db_be16(&b, 4096)) goto fail;
-            /* single value container: stone */
+            /* single-value container: stone — BPE=0, value=1, no data array */
             if (!db_u8(&b, 0)) goto fail;
             if (!db_varint(&b, 1)) goto fail;
-            if (!db_varint(&b, 0)) goto fail;
         } else {
             if (!db_be16(&b, 0)) goto fail;
-            /* single value container: air */
+            /* single-value container: air — BPE=0, value=0, no data array */
             if (!db_u8(&b, 0)) goto fail;
-            if (!db_varint(&b, 0)) goto fail;
             if (!db_varint(&b, 0)) goto fail;
         }
 
