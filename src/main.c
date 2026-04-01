@@ -26,7 +26,7 @@ typedef SOCKET socket_handle_t;
 typedef int socket_handle_t;
 #endif
 
-#define PORT 25566
+#define PORT 25565
 #define BACKLOG 5
 
 // Helper to double-frame a packet: [VarInt total length][VarInt uncompressed length][packet data]
