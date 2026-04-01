@@ -167,6 +167,22 @@ static size_t double_frame_packet(uint8_t *dst, const uint8_t *src, size_t len) 
     return off + inner_off;
 }
 
+static int send_all(socket_handle_t socket_fd, const uint8_t *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+#ifdef _WIN32
+        int n = send(socket_fd, (const char *)(buf + sent), (int)(len - sent), 0);
+#else
+        ssize_t n = send(socket_fd, buf + sent, len - sent, 0);
+#endif
+        if (n <= 0) {
+            return 0;
+        }
+        sent += (size_t)n;
+    }
+    return 1;
+}
+
 static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_t *packet, size_t packet_len) {
     uint8_t framed[8192];
     size_t framed_len = double_frame_packet(framed, packet, packet_len);
@@ -175,11 +191,7 @@ static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_
         return;
     }
 
-#ifdef _WIN32
-    send(socket_fd, (const char*)framed, (int)framed_len, 0);
-#else
-    send(socket_fd, framed, framed_len, 0);
-#endif
+    (void)send_all(socket_fd, framed, framed_len);
 }
 
 // Large-packet version that uses heap allocation for packets that don't fit in
@@ -221,11 +233,7 @@ static void send_large_post_compression_packet(socket_handle_t socket_fd,
         memcpy(frame + outer_vi_len + 1, packet, packet_len);
     }
 
-#ifdef _WIN32
-    send(socket_fd, (const char *)frame, (int)frame_len, 0);
-#else
-    send(socket_fd, frame, frame_len, 0);
-#endif
+    (void)send_all(socket_fd, frame, frame_len);
     free(frame);
 }
 
@@ -886,6 +894,29 @@ int main() {
                                                                 free(cd_buf);
                                                             } else {
                                                                 printf("WARNING: failed to build chunk data packet.\n");
+                                                            }
+
+                                                            /*
+                                                             * Diagnostic safety net: overwrite the same chunk with
+                                                             * a synthetic flat debug chunk so we can prove chunk
+                                                             * transport/state is correct even if NBT conversion fails.
+                                                             */
+                                                            {
+                                                                size_t dbg_len = 0;
+                                                                uint8_t *dbg_buf = build_debug_flat_chunk_packet(
+                                                                    world_info.spawn_chunk_x,
+                                                                    world_info.spawn_chunk_z,
+                                                                    &dbg_len);
+                                                                if (dbg_buf) {
+                                                                    send_large_post_compression_packet(new_socket, dbg_buf, dbg_len);
+                                                                    printf("Sent DEBUG flat chunk for (%d,%d), %zu bytes.\n",
+                                                                           world_info.spawn_chunk_x,
+                                                                           world_info.spawn_chunk_z,
+                                                                           dbg_len);
+                                                                    free(dbg_buf);
+                                                                } else {
+                                                                    printf("WARNING: failed to build DEBUG flat chunk packet.\n");
+                                                                }
                                                             }
 
                                                             // ChunkBatchFinished (0x0B) — batch size = 1

@@ -18,4 +18,11 @@ uint8_t *build_chunk_data_packet(const uint8_t *nbt, size_t nbt_len,
                                   int32_t chunk_x, int32_t chunk_z,
                                   size_t *out_len);
 
+/*
+ * Build a synthetic debug chunk with a full-stone section at y=64..79.
+ * Useful to validate clientbound chunk transport and packet sequencing.
+ */
+uint8_t *build_debug_flat_chunk_packet(int32_t chunk_x, int32_t chunk_z,
+                                       size_t *out_len);
+
 #endif /* CHUNK_SENDER_H */

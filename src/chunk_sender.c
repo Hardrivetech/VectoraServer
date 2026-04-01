@@ -849,3 +849,78 @@ fail:
     free(b.data);
     return NULL;
 }
+
+uint8_t *build_debug_flat_chunk_packet(int32_t chunk_x, int32_t chunk_z,
+                                       size_t *out_len) {
+    dynbuf_t b;
+    memset(&b, 0, sizeof(b));
+
+    if (!out_len) return NULL;
+
+    /* Packet ID */
+    if (!db_varint(&b, 0x2C)) goto fail;
+
+    /* Chunk X, Chunk Z */
+    if (!db_be32(&b, (uint32_t)chunk_x)) goto fail;
+    if (!db_be32(&b, (uint32_t)chunk_z)) goto fail;
+
+    /* Empty Heightmaps compound */
+    {
+        hm_array_t none = {NULL, 0};
+        if (!write_heightmaps_nbt(&b, &none, &none)) goto fail;
+    }
+
+    /* Sections data */
+    size_t data_len_pos = b.len;
+    if (!dynbuf_grow(&b, 5)) goto fail;
+    b.len += 5;
+    size_t data_start = b.len;
+
+    /* Y=64..79 corresponds to section y=4 in -64..319 world */
+    const int stone_section_idx = 4 - SECTION_Y_MIN;
+
+    for (int i = 0; i < NUM_SECTIONS; i++) {
+        if (i == stone_section_idx) {
+            if (!db_be16(&b, 4096)) goto fail;
+            /* single value container: stone */
+            if (!db_u8(&b, 0)) goto fail;
+            if (!db_varint(&b, 1)) goto fail;
+            if (!db_varint(&b, 0)) goto fail;
+        } else {
+            if (!db_be16(&b, 0)) goto fail;
+            /* single value container: air */
+            if (!db_u8(&b, 0)) goto fail;
+            if (!db_varint(&b, 0)) goto fail;
+            if (!db_varint(&b, 0)) goto fail;
+        }
+
+        if (!write_biome_container(&b)) goto fail;
+    }
+
+    {
+        size_t data_bytes = b.len - data_start;
+        uint8_t vi[5];
+        size_t vi_len = write_varint(vi, (int32_t)data_bytes);
+        size_t shift = 5 - vi_len;
+        if (shift > 0) {
+            memmove(b.data + data_len_pos + vi_len,
+                    b.data + data_start,
+                    data_bytes);
+            b.len -= shift;
+        }
+        memcpy(b.data + data_len_pos, vi, vi_len);
+    }
+
+    /* Block entities = 0 */
+    if (!db_varint(&b, 0)) goto fail;
+
+    /* Light */
+    if (!write_light_data(&b)) goto fail;
+
+    *out_len = b.len;
+    return b.data;
+
+fail:
+    free(b.data);
+    return NULL;
+}
