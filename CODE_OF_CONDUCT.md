@@ -65,4 +65,4 @@ Retaliation against anyone who reports a concern in good faith will not be toler
 This Code of Conduct is adapted from the Contributor Covenant, version 2.1, with wording tuned for the Vectora Server project.
 License and Contact
 
-This Code of Conduct is available under the same license as the project. If you have questions about this Code of Conduct, or its enforcement, contact the maintainers at: conduct@vectora.example (replace with your contact).
+This Code of Conduct is available under the same license as the project. If you have questions about this Code of Conduct, or its enforcement, contact the maintainers at: Vectora-Contact@protonmail.com
