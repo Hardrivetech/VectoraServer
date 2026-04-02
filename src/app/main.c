@@ -49,6 +49,9 @@ static int g_log_chunk_sends = 1;
 #define MAX_PLAY_CHAT_SOCKETS 128
 #define MAX_MUTED_PLAYERS 128
 #define MAX_MODERATORS 64
+#define MODERATORS_FILE_PATH "moderators.txt"
+#define MUTED_FILE_PATH "muted.txt"
+#define MOD_AUDIT_LOG_FILE_PATH "moderation.log"
 
 #define PLAY774_C2S_CHAT_COMMAND        0x06
 #define PLAY774_C2S_CHAT_COMMAND_SIGNED 0x07
@@ -411,6 +414,194 @@ static int ensure_initial_moderator(const char *username) {
     PLAY_CHAT_UNLOCK();
 
     return promoted;
+}
+
+static int save_username_list_to_file(const char *path,
+                                      char list[][32],
+                                      size_t count) {
+    FILE *fp;
+    size_t i;
+
+    if (path == NULL) {
+        return 0;
+    }
+
+    fp = fopen(path, "wb");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < count; ++i) {
+        if (list[i][0] == '\0') {
+            continue;
+        }
+        fputs(list[i], fp);
+        fputc('\n', fp);
+    }
+
+    fclose(fp);
+    return 1;
+}
+
+static size_t load_username_list_from_file(const char *path,
+                                           char list[][32],
+                                           size_t max_count) {
+    FILE *fp;
+    char line[256];
+    size_t count = 0;
+
+    if (path == NULL) {
+        return 0;
+    }
+
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL && count < max_count) {
+        char name[32];
+        size_t n;
+
+        n = strcspn(line, "\r\n");
+        line[n] = '\0';
+        while (line[0] == ' ' || line[0] == '\t') {
+            memmove(line, line + 1, strlen(line));
+        }
+        while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t')) {
+            line[n - 1] = '\0';
+            --n;
+        }
+
+        if (line[0] == '\0' || line[0] == '#') {
+            continue;
+        }
+
+        snprintf(name, sizeof(name), "%s", line);
+        {
+            size_t i;
+            int dup = 0;
+            for (i = 0; i < count; ++i) {
+                if (username_equals_ci(list[i], name)) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup) {
+                snprintf(list[count], sizeof(list[count]), "%s", name);
+                count += 1;
+            }
+        }
+    }
+
+    fclose(fp);
+    return count;
+}
+
+static int save_moderation_state(void) {
+    char moderators_snapshot[MAX_MODERATORS][32];
+    char muted_snapshot[MAX_MUTED_PLAYERS][32];
+    size_t moderators_count = 0;
+    size_t muted_count = 0;
+    size_t i;
+    int ok_mod;
+    int ok_muted;
+
+    PLAY_CHAT_LOCK();
+    moderators_count = g_moderator_username_count;
+    muted_count = g_muted_username_count;
+    if (moderators_count > MAX_MODERATORS) {
+        moderators_count = MAX_MODERATORS;
+    }
+    if (muted_count > MAX_MUTED_PLAYERS) {
+        muted_count = MAX_MUTED_PLAYERS;
+    }
+
+    for (i = 0; i < moderators_count; ++i) {
+        snprintf(moderators_snapshot[i], sizeof(moderators_snapshot[i]), "%s", g_moderator_usernames[i]);
+    }
+    for (i = 0; i < muted_count; ++i) {
+        snprintf(muted_snapshot[i], sizeof(muted_snapshot[i]), "%s", g_muted_usernames[i]);
+    }
+    PLAY_CHAT_UNLOCK();
+
+    ok_mod = save_username_list_to_file(MODERATORS_FILE_PATH, moderators_snapshot, moderators_count);
+    ok_muted = save_username_list_to_file(MUTED_FILE_PATH, muted_snapshot, muted_count);
+    return ok_mod && ok_muted;
+}
+
+static void load_moderation_state(void) {
+    char moderators_loaded[MAX_MODERATORS][32] = {0};
+    char muted_loaded[MAX_MUTED_PLAYERS][32] = {0};
+    size_t moderators_count;
+    size_t muted_count;
+    size_t i;
+
+    moderators_count = load_username_list_from_file(MODERATORS_FILE_PATH,
+                                                    moderators_loaded,
+                                                    MAX_MODERATORS);
+    muted_count = load_username_list_from_file(MUTED_FILE_PATH,
+                                               muted_loaded,
+                                               MAX_MUTED_PLAYERS);
+
+    PLAY_CHAT_LOCK();
+    g_moderator_username_count = 0;
+    g_muted_username_count = 0;
+
+    for (i = 0; i < moderators_count; ++i) {
+        snprintf(g_moderator_usernames[g_moderator_username_count],
+                 sizeof(g_moderator_usernames[g_moderator_username_count]),
+                 "%s",
+                 moderators_loaded[i]);
+        g_moderator_username_count += 1;
+    }
+
+    for (i = 0; i < muted_count; ++i) {
+        snprintf(g_muted_usernames[g_muted_username_count],
+                 sizeof(g_muted_usernames[g_muted_username_count]),
+                 "%s",
+                 muted_loaded[i]);
+        g_muted_username_count += 1;
+    }
+    PLAY_CHAT_UNLOCK();
+}
+
+static void append_moderation_audit(const char *actor,
+                                    const char *action,
+                                    const char *target,
+                                    const char *details) {
+    FILE *fp;
+    time_t now;
+    struct tm tmv;
+    char timestamp[32];
+    const char *actor_name = (actor != NULL && actor[0] != '\0') ? actor : "SYSTEM";
+    const char *action_name = (action != NULL && action[0] != '\0') ? action : "UNKNOWN";
+    const char *target_name = (target != NULL && target[0] != '\0') ? target : "-";
+    const char *detail_text = (details != NULL && details[0] != '\0') ? details : "";
+
+    fp = fopen(MOD_AUDIT_LOG_FILE_PATH, "ab");
+    if (fp == NULL) {
+        return;
+    }
+
+    now = time(NULL);
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tmv) == 0) {
+        snprintf(timestamp, sizeof(timestamp), "0000-00-00 00:00:00");
+    }
+
+    fprintf(fp,
+            "[%s] actor=%s action=%s target=%s details=%s\n",
+            timestamp,
+            actor_name,
+            action_name,
+            target_name,
+            detail_text);
+    fclose(fp);
 }
 
 static void register_play_chat_socket(socket_handle_t socket_fd) {
@@ -1555,6 +1746,8 @@ static void run_play_state_loop(client_session_t *session,
                      "[MOD] %s is now a moderator (first player).",
                      session->username[0] ? session->username : "Player");
             broadcast_system_chat_message(mod_msg, 0);
+            append_moderation_audit("SYSTEM", "AUTO_OP", session->username, "first-player bootstrap");
+            (void)save_moderation_state();
         }
         {
             char join_msg[128];
@@ -1885,6 +2078,8 @@ static void run_play_state_loop(client_session_t *session,
                                                  sizeof(feedback),
                                                  "[MOD] Muted %s.",
                                                  target_name);
+                                        append_moderation_audit(session->username, "MUTE", target_name, "ok");
+                                        (void)save_moderation_state();
                                     } else {
                                         snprintf(feedback,
                                                  sizeof(feedback),
@@ -1904,6 +2099,8 @@ static void run_play_state_loop(client_session_t *session,
                                                  sizeof(feedback),
                                                  "[MOD] Unmuted %s.",
                                                  target_name);
+                                        append_moderation_audit(session->username, "UNMUTE", target_name, "ok");
+                                        (void)save_moderation_state();
                                     } else {
                                         snprintf(feedback,
                                                  sizeof(feedback),
@@ -1955,6 +2152,8 @@ static void run_play_state_loop(client_session_t *session,
                                                  "[MOD] %s is now a moderator.",
                                                  target_name);
                                         broadcast_system_chat_message(feedback, 0);
+                                        append_moderation_audit(session->username, "OP", target_name, "ok");
+                                        (void)save_moderation_state();
                                     } else {
                                         snprintf(feedback,
                                                  sizeof(feedback),
@@ -1978,6 +2177,8 @@ static void run_play_state_loop(client_session_t *session,
                                                      "[MOD] %s is no longer a moderator.",
                                                      target_name);
                                             broadcast_system_chat_message(feedback, 0);
+                                            append_moderation_audit(session->username, "DEOP", target_name, "ok");
+                                            (void)save_moderation_state();
                                         } else if (rc == -1) {
                                             snprintf(feedback,
                                                      sizeof(feedback),
@@ -3293,6 +3494,7 @@ int main() {
     }
 #endif
     init_play_chat_lock();
+    load_moderation_state();
 
     server_config_status = load_server_config_with_fallbacks(
         &server_config,
@@ -3455,9 +3657,11 @@ int main() {
 
 #ifdef _WIN32
     closesocket(server_fd);
+    (void)save_moderation_state();
     destroy_play_chat_lock();
     WSACleanup();
 #else
+    (void)save_moderation_state();
     destroy_play_chat_lock();
 #endif
     return 0;
