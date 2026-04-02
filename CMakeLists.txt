@@ -25,6 +25,8 @@ add_executable(Vectora
 	src/play/packet/game_rules.c
 	src/play/player/player_position.c
 	src/play/packet/play_packets.c
+	src/play/entity/entity_registry.c
+	src/play/entity/entity_manager.c
 	src/play/chunk/chunk_sender.c
 	${VECTORA_ICON}
 )
@@ -39,5 +41,6 @@ target_include_directories(Vectora PRIVATE
 	src/world/storage
 	src/play/packet
 	src/play/player
+	src/play/entity
 	src/play/chunk
 )

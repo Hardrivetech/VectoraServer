@@ -174,6 +174,21 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     if (strcmp(key, "chunk_stream_radius") == 0) {
         return parse_int_in_range(value, 0, 12, &config->chunk_stream_radius);
     }
+    if (strcmp(key, "keep_alive_interval_seconds") == 0) {
+        return parse_int_in_range(value, 1, 300, &config->keep_alive_interval_seconds);
+    }
+    if (strcmp(key, "play_idle_timeout_seconds") == 0) {
+        return parse_int_in_range(value, 0, 3600, &config->play_idle_timeout_seconds);
+    }
+    if (strcmp(key, "serverbound_keep_alive_packet_id") == 0) {
+        return parse_int_in_range(value, 0, 255, &config->serverbound_keep_alive_packet_id);
+    }
+    if (strcmp(key, "idle_position_epsilon_milliblocks") == 0) {
+        return parse_int_in_range(value, 0, 10000, &config->idle_position_epsilon_milliblocks);
+    }
+    if (strcmp(key, "play_disconnect_packet_id") == 0) {
+        return parse_int_in_range(value, 0, 255, &config->play_disconnect_packet_id);
+    }
     if (strcmp(key, "view_distance") == 0) {
         return parse_int_in_range(value, 2, 32, &config->view_distance);
     }
@@ -194,6 +209,12 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     }
     if (strcmp(key, "spawn_protection_radius") == 0) {
         return parse_int_in_range(value, 0, 1000, &config->spawn_protection_radius);
+    }
+    if (strcmp(key, "game_event_respawn_screen_value") == 0) {
+        return parse_int_in_range(value, 0, 1, &config->game_event_respawn_screen_value);
+    }
+    if (strcmp(key, "game_event_limited_crafting_value") == 0) {
+        return parse_int_in_range(value, 0, 1, &config->game_event_limited_crafting_value);
     }
     if (strcmp(key, "rule_do_daylight_cycle") == 0) {
         return parse_bool_value(value, &config->game_rules.do_daylight_cycle);
@@ -246,6 +267,9 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     if (strcmp(key, "motd") == 0) {
         return parse_string_value(value, config->motd, sizeof(config->motd));
     }
+    if (strcmp(key, "idle_disconnect_reason") == 0) {
+        return parse_string_value(value, config->idle_disconnect_reason, sizeof(config->idle_disconnect_reason));
+    }
     if (strcmp(key, "world_path") == 0) {
         return parse_string_value(value, config->world_path, sizeof(config->world_path));
     }
@@ -270,12 +294,32 @@ static int assign_config_value(server_config_t *config, const char *key, const c
         config->send_brand_packet = parsed;
         return 1;
     }
+    if (strcmp(key, "enable_experimental_entities") == 0) {
+        config->enable_experimental_entities = parsed;
+        return 1;
+    }
+    if (strcmp(key, "enable_experimental_entity_packets") == 0) {
+        config->enable_experimental_entity_packets = parsed;
+        return 1;
+    }
     if (strcmp(key, "send_game_rules_packet") == 0) {
         config->send_game_rules_packet = parsed;
         return 1;
     }
     if (strcmp(key, "send_wait_for_level_chunks_event") == 0) {
         config->send_wait_for_level_chunks_event = parsed;
+        return 1;
+    }
+    if (strcmp(key, "send_idle_disconnect_packet") == 0) {
+        config->send_idle_disconnect_packet = parsed;
+        return 1;
+    }
+    if (strcmp(key, "idle_timeout_counts_keep_alive") == 0) {
+        config->idle_timeout_counts_keep_alive = parsed;
+        return 1;
+    }
+    if (strcmp(key, "idle_timeout_requires_position_change") == 0) {
+        config->idle_timeout_requires_position_change = parsed;
         return 1;
     }
     if (strcmp(key, "reject_protocol_mismatch") == 0) {
@@ -288,6 +332,14 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     }
     if (strcmp(key, "log_play_packets") == 0) {
         config->log_play_packets = parsed;
+        return 1;
+    }
+    if (strcmp(key, "log_play_session_summary") == 0) {
+        config->log_play_session_summary = parsed;
+        return 1;
+    }
+    if (strcmp(key, "log_entity_events") == 0) {
+        config->log_entity_events = parsed;
         return 1;
     }
     if (strcmp(key, "log_chunk_sends") == 0) {
@@ -363,6 +415,14 @@ void set_server_config_defaults(server_config_t *config) {
     config->protocol_number = 774;
     config->compression_threshold = 256;
     config->chunk_stream_radius = 0;
+    config->keep_alive_interval_seconds = 10;
+    config->play_idle_timeout_seconds = 30;
+    config->idle_timeout_counts_keep_alive = 0;
+    config->serverbound_keep_alive_packet_id = 0x13;
+    config->idle_timeout_requires_position_change = 1;
+    config->idle_position_epsilon_milliblocks = 50;
+    config->send_idle_disconnect_packet = 0;
+    config->play_disconnect_packet_id = 0x1A;
     config->view_distance = 10;
     config->simulation_distance = 10;
     config->game_mode = 0;
@@ -375,16 +435,23 @@ void set_server_config_defaults(server_config_t *config) {
     config->enable_real_chunks = 1;
     config->allow_debug_chunk_fallback = 1;
     config->send_brand_packet = 1;
+    config->enable_experimental_entities = 0;
+    config->enable_experimental_entity_packets = 0;
     config->send_game_rules_packet = 0;
     config->send_wait_for_level_chunks_event = 1;
+    config->game_event_respawn_screen_value = 0;
+    config->game_event_limited_crafting_value = 0;
     config->reject_protocol_mismatch = 1;
     config->log_packet_framing = 1;
     config->log_play_packets = 0;
+    config->log_play_session_summary = 1;
+    config->log_entity_events = 0;
     config->log_chunk_sends = 1;
     config->offline_mode = 1;
     snprintf(config->server_brand, sizeof(config->server_brand), "%s", "Vectora");
     snprintf(config->protocol_name, sizeof(config->protocol_name), "%s", "Vectora 1.21.11");
     snprintf(config->motd, sizeof(config->motd), "%s", "Welcome to Vectora!");
+    snprintf(config->idle_disconnect_reason, sizeof(config->idle_disconnect_reason), "%s", "Timed out due to inactivity.");
     config->world_path[0] = '\0';
 }
 

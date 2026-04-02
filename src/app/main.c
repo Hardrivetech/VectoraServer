@@ -13,6 +13,8 @@
 #include "join_game.h"
 #include "player_position.h"
 #include "play_packets.h"
+#include "entity_registry.h"
+#include "entity_manager.h"
 #include "world_loader.h"
 #include "chunk_sender.h"
 
@@ -101,6 +103,10 @@ typedef struct {
     server_config_t server_config;
     int32_t client_protocol_version;
     client_stream_state_t stream_state;
+    entity_registry_t entity_registry;
+    entity_manager_t entity_manager;
+    int32_t mock_entity_a;
+    int32_t mock_entity_b;
 } client_session_t;
 
 static void send_large_post_compression_packet(socket_handle_t socket_fd,
@@ -125,6 +131,40 @@ static double read_be_double_ptr(const uint8_t *src) {
     } u;
     u.bits = read_be64_ptr(src);
     return u.value;
+}
+
+static const char *entity_event_kind_name(int event_kind) {
+    switch (event_kind) {
+        case ENTITY_EVENT_SPAWN:
+            return "spawn";
+        case ENTITY_EVENT_UPDATE:
+            return "update";
+        case ENTITY_EVENT_REMOVE:
+            return "remove";
+        default:
+            return "unknown";
+    }
+}
+
+static void log_and_clear_entity_events(entity_manager_t *manager) {
+    if (manager == NULL || manager->pending_count == 0) {
+        return;
+    }
+
+    printf("Entity event dump: count=%zu, dropped=%zu\n", manager->pending_count, manager->dropped_events);
+    for (size_t i = 0; i < manager->pending_count; ++i) {
+        const entity_event_t *evt = &manager->pending[i];
+        printf("  [%zu] kind=%s id=%d entity_kind=%d pos=(%.3f, %.3f, %.3f)\n",
+               i,
+               entity_event_kind_name(evt->event_kind),
+               evt->entity_id,
+               evt->entity_kind,
+               evt->x,
+               evt->y,
+               evt->z);
+    }
+
+    entity_manager_clear(manager);
 }
 
 static int read_post_compression_packet_data(const uint8_t *buf,
@@ -494,6 +534,90 @@ static void send_login_disconnect(socket_handle_t socket_fd, const char *reason_
     (void)send_all(socket_fd, framed, framed_len);
 }
 
+static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_t *packet, size_t packet_len);
+
+static void build_text_component_json(const char *text, char *out_json, size_t out_json_size) {
+    size_t out = 0;
+    if (out_json_size < 3) {
+        return;
+    }
+
+    out_json[out++] = '{';
+    out_json[out++] = '"';
+    out_json[out++] = 't';
+    out_json[out++] = 'e';
+    out_json[out++] = 'x';
+    out_json[out++] = 't';
+    out_json[out++] = '"';
+    out_json[out++] = ':';
+    out_json[out++] = '"';
+
+    for (size_t i = 0; text[i] != '\0' && out + 2 < out_json_size; ++i) {
+        unsigned char ch = (unsigned char)text[i];
+        if (ch == '"' || ch == '\\') {
+            if (out + 2 >= out_json_size) {
+                break;
+            }
+            out_json[out++] = '\\';
+            out_json[out++] = (char)ch;
+        } else if (ch < 0x20) {
+            out_json[out++] = ' ';
+        } else {
+            out_json[out++] = (char)ch;
+        }
+    }
+
+    if (out + 2 >= out_json_size) {
+        out = out_json_size - 3;
+    }
+    out_json[out++] = '"';
+    out_json[out++] = '}';
+    out_json[out] = '\0';
+}
+
+static size_t write_network_nbt_string(uint8_t *outbuf, size_t outbuf_size, const char *text) {
+    size_t text_len;
+
+    if (outbuf == NULL || text == NULL || outbuf_size < 3) {
+        return 0;
+    }
+
+    text_len = strlen(text);
+    if (text_len > 65535 || outbuf_size < (size_t)(3 + text_len)) {
+        return 0;
+    }
+
+    outbuf[0] = 0x08; // TAG_String (network NBT root)
+    outbuf[1] = (uint8_t)((text_len >> 8) & 0xFF);
+    outbuf[2] = (uint8_t)(text_len & 0xFF);
+    memcpy(outbuf + 3, text, text_len);
+    return 3 + text_len;
+}
+
+static void send_play_disconnect(socket_handle_t socket_fd,
+                                 int packet_id,
+                                 const char *reason_text,
+                                 int use_network_nbt_string) {
+    uint8_t packet[512];
+    size_t packet_len = 0;
+
+    packet_len += write_varint(packet + packet_len, packet_id);
+    if (use_network_nbt_string) {
+        size_t nbt_len = write_network_nbt_string(packet + packet_len,
+                                                  sizeof(packet) - packet_len,
+                                                  reason_text);
+        if (nbt_len == 0) {
+            return;
+        }
+        packet_len += nbt_len;
+    } else {
+        char reason_json[320];
+        build_text_component_json(reason_text, reason_json, sizeof(reason_json));
+        packet_len += write_mc_string_raw(packet + packet_len, reason_json);
+    }
+    send_post_compression_packet(socket_fd, packet, packet_len);
+}
+
 static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_t *packet, size_t packet_len) {
     uint8_t framed[8192];
     size_t framed_len = double_frame_packet(framed, packet, packet_len);
@@ -659,18 +783,92 @@ static void run_play_state_loop(client_session_t *session,
 
     {
         int entered_play_state = 1;
+        int idle_timeout_triggered = 0;
+        uint64_t keepalive_sent = 0;
+        uint64_t play_packets_received = 0;
+        uint64_t play_packets_parsed = 0;
+        uint64_t play_packets_parse_failed = 0;
         increment_connected_play_sessions();
         time_t last_keepalive = time(NULL);
+        time_t last_client_activity = time(NULL);
+        time_t last_entity_event_log = time(NULL);
+        time_t last_mock_entity_update = time(NULL);
+        double last_activity_x = 0.0;
+        double last_activity_z = 0.0;
+        int has_last_activity_position = 0;
         int64_t ka_id = 1;
         for (;;) {
-            // Send Keep Alive every 10 seconds
+            // Send Keep Alive on the configured interval.
             time_t now = time(NULL);
-            if (now - last_keepalive >= 10) {
+            if (now - last_keepalive >= session->server_config.keep_alive_interval_seconds) {
                 uint8_t ka_buf[32];
                 size_t ka_len = build_keep_alive_packet(ka_buf, sizeof(ka_buf), ka_id++);
                 send_post_compression_packet(socket_fd, ka_buf, ka_len);
+                keepalive_sent += 1;
                 printf("Sent Keep Alive (id=%lld).\n", (long long)(ka_id - 1));
                 last_keepalive = now;
+            }
+
+            if (session->server_config.log_entity_events &&
+                now - last_entity_event_log >= 1 &&
+                entity_manager_pending_count(&session->entity_manager) > 0) {
+                log_and_clear_entity_events(&session->entity_manager);
+                last_entity_event_log = now;
+            }
+
+            if (session->server_config.enable_experimental_entities &&
+                session->mock_entity_a != 0 &&
+                session->mock_entity_b != 0 &&
+                now - last_mock_entity_update >= 1) {
+                double anchor_x = has_last_activity_position ? last_activity_x : 0.5;
+                double anchor_z = has_last_activity_position ? last_activity_z : 0.5;
+                double phase = (double)(now % 60) * 0.20;
+                double ax = anchor_x + 2.0 + sin(phase) * 0.75;
+                double az = anchor_z + 1.0 + cos(phase) * 0.75;
+                double bx = anchor_x - 2.0 + cos(phase * 0.9) * 0.75;
+                double bz = anchor_z - 1.0 + sin(phase * 0.9) * 0.75;
+
+                (void)entity_manager_queue_update_xz(&session->entity_registry,
+                                                     &session->entity_manager,
+                                                     session->mock_entity_a,
+                                                     ax,
+                                                     az);
+                (void)entity_manager_queue_update_xz(&session->entity_registry,
+                                                     &session->entity_manager,
+                                                     session->mock_entity_b,
+                                                     bx,
+                                                     bz);
+                last_mock_entity_update = now;
+            }
+
+            if (session->server_config.play_idle_timeout_seconds > 0 &&
+                now - last_client_activity >= session->server_config.play_idle_timeout_seconds) {
+                printf("Closing idle play session after %d seconds without client traffic.\n",
+                       session->server_config.play_idle_timeout_seconds);
+                if (session->server_config.send_idle_disconnect_packet) {
+                    int disconnect_packet_id = session->server_config.play_disconnect_packet_id;
+                    int use_network_nbt_string = 0;
+
+                    if (session->client_protocol_version == 774) {
+                        // Protocol 774 expects kick_disconnect on 0x1D with NBT-encoded text.
+                        if (disconnect_packet_id == 0x1A) {
+                            disconnect_packet_id = 0x1D;
+                        }
+                        if (disconnect_packet_id == 0x1D) {
+                            use_network_nbt_string = 1;
+                        }
+                    }
+
+                    send_play_disconnect(socket_fd,
+                                         disconnect_packet_id,
+                                         session->server_config.idle_disconnect_reason,
+                                         use_network_nbt_string);
+                    printf("Sent play disconnect packet for idle timeout (id=0x%02X, format=%s).\n",
+                           disconnect_packet_id,
+                           use_network_nbt_string ? "network-nbt-string" : "mc-string-json");
+                }
+                idle_timeout_triggered = 1;
+                break;
             }
 
             uint8_t play_buf[2048];
@@ -687,6 +885,7 @@ static void run_play_state_loop(client_session_t *session,
                 break;
             }
 #endif
+            play_packets_received += 1;
             {
                 int32_t play_pid = -1;
                 const uint8_t *play_payload = NULL;
@@ -701,19 +900,63 @@ static void run_play_state_loop(client_session_t *session,
                         &play_payload_len,
                         inflate_tmp,
                         sizeof(inflate_tmp))) {
+                    int counts_as_activity = 1;
+                    int has_position = 0;
+                    double player_x = 0.0;
+                    double player_z = 0.0;
+                    play_packets_parsed += 1;
+                    if (!session->server_config.idle_timeout_counts_keep_alive &&
+                        play_pid == session->server_config.serverbound_keep_alive_packet_id) {
+                        counts_as_activity = 0;
+                        if (g_log_play_packets) {
+                            printf("Ignoring keep-alive reply for idle timeout (packet ID %d).\n", play_pid);
+                        }
+                    }
+
+                    has_position = try_extract_position_from_play_packet(
+                        play_pid,
+                        play_payload,
+                        play_payload_len,
+                        &player_x,
+                        &player_z);
+
+                    if (session->server_config.idle_timeout_requires_position_change) {
+                        if (has_position) {
+                            if (has_last_activity_position) {
+                                double dx = fabs(player_x - last_activity_x);
+                                double dz = fabs(player_z - last_activity_z);
+                                double epsilon = (double)session->server_config.idle_position_epsilon_milliblocks / 1000.0;
+                                if (dx <= epsilon && dz <= epsilon) {
+                                    counts_as_activity = 0;
+                                }
+                            }
+                        } else {
+                            counts_as_activity = 0;
+                        }
+                    }
+
+                    if (counts_as_activity) {
+                        last_client_activity = time(NULL);
+                        if (has_position) {
+                            last_activity_x = player_x;
+                            last_activity_z = player_z;
+                            has_last_activity_position = 1;
+                        }
+                    }
+
+                    if (has_position) {
+                        (void)entity_manager_queue_update_xz(&session->entity_registry,
+                                                             &session->entity_manager,
+                                                             1,
+                                                             player_x,
+                                                             player_z);
+                    }
                     if (g_log_play_packets) {
                         printf("Play packet ID from client: %d\n", play_pid);
                     }
 
                     {
-                        double player_x = 0.0;
-                        double player_z = 0.0;
-                        if (try_extract_position_from_play_packet(
-                                play_pid,
-                                play_payload,
-                                play_payload_len,
-                                &player_x,
-                                &player_z)) {
+                        if (has_position) {
                             int32_t moved_chunk_x = (int32_t)floor(player_x / 16.0);
                             int32_t moved_chunk_z = (int32_t)floor(player_z / 16.0);
 
@@ -766,12 +1009,57 @@ static void run_play_state_loop(client_session_t *session,
                         }
                     }
                 } else {
+                    play_packets_parse_failed += 1;
                     if (g_log_packet_framing) {
                         printf("Failed to parse play packet in post-compression format.\n");
                     }
                 }
             }
         }
+
+        (void)entity_manager_queue_remove(&session->entity_registry, &session->entity_manager, 1);
+        if (session->mock_entity_a != 0) {
+            (void)entity_manager_queue_remove(&session->entity_registry,
+                                              &session->entity_manager,
+                                              session->mock_entity_a);
+        }
+        if (session->mock_entity_b != 0) {
+            (void)entity_manager_queue_remove(&session->entity_registry,
+                                              &session->entity_manager,
+                                              session->mock_entity_b);
+        }
+
+        if (session->server_config.enable_experimental_entity_packets &&
+            session->client_protocol_version == 774 &&
+            (session->mock_entity_a != 0 || session->mock_entity_b != 0)) {
+            // Send Remove Entities (0x4B) for mock entities on disconnect.
+            int32_t remove_ids[2];
+            size_t remove_count = 0;
+            if (session->mock_entity_a != 0) remove_ids[remove_count++] = session->mock_entity_a;
+            if (session->mock_entity_b != 0) remove_ids[remove_count++] = session->mock_entity_b;
+            uint8_t rem_buf[32];
+            size_t rem_len = build_entity_destroy_packet(rem_buf, sizeof(rem_buf), remove_ids, remove_count);
+            send_post_compression_packet(socket_fd, rem_buf, rem_len);
+            printf("Sent Remove Entities for mock entities on disconnect.\n");
+        }
+
+        if (session->server_config.log_entity_events) {
+            log_and_clear_entity_events(&session->entity_manager);
+        }
+
+        if (session->server_config.log_play_session_summary) {
+                 printf("Play session summary: reason=%s, keepalives_sent=%llu, packets_received=%llu, packets_parsed=%llu, packets_parse_failed=%llu, tracked_entities=%zu, pending_entity_events=%zu, dropped_entity_events=%zu\n",
+                   idle_timeout_triggered ? "idle-timeout" : "socket-closed",
+                   (unsigned long long)keepalive_sent,
+                   (unsigned long long)play_packets_received,
+                   (unsigned long long)play_packets_parsed,
+                   (unsigned long long)play_packets_parse_failed,
+                   entity_registry_count(&session->entity_registry),
+                     entity_manager_pending_count(&session->entity_manager),
+                     entity_manager_dropped_count(&session->entity_manager));
+        }
+
+        entity_manager_clear(&session->entity_manager);
 
         if (entered_play_state) {
             decrement_connected_play_sessions();
@@ -1324,6 +1612,32 @@ static void handle_client_connection(client_session_t *session) {
                                             printf("Sent Game Event 13 (Start waiting for level chunks).\n");
                                         }
 
+                                        // Game Event 11: enable respawn screen / immediate respawn.
+                                        {
+                                            uint8_t ge_buf[32];
+                                            size_t ge_len = build_game_event_packet(
+                                                ge_buf,
+                                                sizeof(ge_buf),
+                                                11,
+                                                (float)server_config.game_event_respawn_screen_value);
+                                            send_post_compression_packet(new_socket, ge_buf, ge_len);
+                                            printf("Sent Game Event 11 (Respawn Screen=%d).\n",
+                                                   server_config.game_event_respawn_screen_value);
+                                        }
+
+                                        // Game Event 12: limited crafting toggle.
+                                        {
+                                            uint8_t ge_buf[32];
+                                            size_t ge_len = build_game_event_packet(
+                                                ge_buf,
+                                                sizeof(ge_buf),
+                                                12,
+                                                (float)server_config.game_event_limited_crafting_value);
+                                            send_post_compression_packet(new_socket, ge_buf, ge_len);
+                                            printf("Sent Game Event 12 (Limited Crafting=%d).\n",
+                                                   server_config.game_event_limited_crafting_value);
+                                        }
+
                                         {
                                             int32_t debug_chunk_x = has_world_info ? world_info.spawn_chunk_x : 0;
                                             int32_t debug_chunk_z = has_world_info ? world_info.spawn_chunk_z : 0;
@@ -1514,17 +1828,24 @@ static void handle_client_connection(client_session_t *session) {
                                                 printf("Sent Update Time.\n");
                                             }
 
-                                            // Send Game Rules only when explicitly enabled and the client matches the configured protocol.
+                                            // Game Rules are not currently validated for protocol 774.
+                                            // Packet ID 0x5D collides with a different clientbound play packet there,
+                                            // so do not send this packet on that protocol even when enabled in config.
                                             if (server_config.send_game_rules_packet &&
-                                                session->client_protocol_version == server_config.protocol_number) {
+                                                session->client_protocol_version == server_config.protocol_number &&
+                                                server_config.protocol_number != 774) {
                                                 uint8_t game_rules_buf[4096];
                                                 size_t game_rules_len = build_game_rules_packet(game_rules_buf, sizeof(game_rules_buf), &server_config.game_rules);
                                                 send_post_compression_packet(new_socket, game_rules_buf, game_rules_len);
                                                 printf("Sent Game Rules packet (%zu bytes).\n", game_rules_len);
                                             } else if (server_config.send_game_rules_packet) {
-                                                printf("Skipped Game Rules packet due to protocol mismatch (client=%d, configured=%d).\n",
-                                                       session->client_protocol_version,
-                                                       server_config.protocol_number);
+                                                if (session->client_protocol_version != server_config.protocol_number) {
+                                                    printf("Skipped Game Rules packet due to protocol mismatch (client=%d, configured=%d).\n",
+                                                           session->client_protocol_version,
+                                                           server_config.protocol_number);
+                                                } else if (server_config.protocol_number == 774) {
+                                                    printf("Skipped Game Rules packet because it is not validated for protocol 774.\n");
+                                                }
                                             }
 
                                             // Player Position and Look
@@ -1543,6 +1864,80 @@ static void handle_client_connection(client_session_t *session) {
                                                     send_post_compression_packet(new_socket, pos_buf, pos_len);
                                                 }
                                                 printf("Sent Player Position and Look to client.\n");
+
+                                                if (!entity_manager_queue_spawn(&session->entity_registry,
+                                                                                &session->entity_manager,
+                                                                                1,
+                                                                                ENTITY_KIND_PLAYER,
+                                                                                pos_params.x,
+                                                                                pos_params.y,
+                                                                                pos_params.z)) {
+                                                    printf("WARNING: failed to register local player entity in registry.\n");
+                                                }
+                                            }
+
+                                            if (server_config.enable_experimental_entities) {
+                                                printf("Experimental entities enabled: packet sends are still guarded until per-packet validation is complete.\n");
+                                                if (!server_config.enable_experimental_entity_packets) {
+                                                    printf("Outbound entity packets are disabled by config gate (enable_experimental_entity_packets=false).\n");
+                                                }
+
+                                                {
+                                                    int32_t mock_a = 0;
+                                                    int32_t mock_b = 0;
+                                                    int spawned_a = entity_manager_queue_spawn_auto(
+                                                        &session->entity_registry,
+                                                        &session->entity_manager,
+                                                        ENTITY_KIND_MOB,
+                                                        (double)player_spawn_x + 2.0,
+                                                        (double)player_spawn_y,
+                                                        (double)player_spawn_z + 1.0,
+                                                        &mock_a);
+                                                    int spawned_b = entity_manager_queue_spawn_auto(
+                                                        &session->entity_registry,
+                                                        &session->entity_manager,
+                                                        ENTITY_KIND_MOB,
+                                                        (double)player_spawn_x - 2.0,
+                                                        (double)player_spawn_y,
+                                                        (double)player_spawn_z - 1.0,
+                                                        &mock_b);
+                                                    if (spawned_a && spawned_b) {
+                                                        session->mock_entity_a = mock_a;
+                                                        session->mock_entity_b = mock_b;
+                                                        printf("Queued internal mock entities: ids=%d,%d.\n", mock_a, mock_b);
+
+                                                        if (server_config.enable_experimental_entity_packets &&
+                                                            session->client_protocol_version == 774) {
+                                                            // Send Spawn Entity (0x01) for both mock entities.
+                                                            // Entity type 2 = armor_stand (placeholder — verify against
+                                                            // minecraft:entity_type registry for protocol 774).
+                                                            uint8_t se_buf[128];
+                                                            size_t se_len;
+
+                                                            se_len = build_spawn_entity_packet(
+                                                                se_buf, sizeof(se_buf),
+                                                                mock_a,
+                                                                2, // entity type: armor_stand placeholder
+                                                                (double)player_spawn_x + 2.0,
+                                                                (double)player_spawn_y,
+                                                                (double)player_spawn_z + 1.0,
+                                                                0, 0, 0, 0);
+                                                            send_post_compression_packet(new_socket, se_buf, se_len);
+
+                                                            se_len = build_spawn_entity_packet(
+                                                                se_buf, sizeof(se_buf),
+                                                                mock_b,
+                                                                2, // entity type: armor_stand placeholder
+                                                                (double)player_spawn_x - 2.0,
+                                                                (double)player_spawn_y,
+                                                                (double)player_spawn_z - 1.0,
+                                                                0, 0, 0, 0);
+                                                            send_post_compression_packet(new_socket, se_buf, se_len);
+
+                                                            printf("Sent Spawn Entity for mock entities %d and %d.\n", mock_a, mock_b);
+                                                        }
+                                                    }
+                                                }
                                             }
 
                                             run_play_state_loop(
@@ -1741,6 +2136,8 @@ int main() {
             session->socket_fd = new_socket;
             session->server_fd = server_fd;
             session->server_config = server_config;
+            entity_registry_init(&session->entity_registry);
+            entity_manager_init(&session->entity_manager);
 
             // Increment before spawning thread to avoid race condition
             increment_active_connections();

@@ -12,5 +12,27 @@ size_t build_game_event_packet(uint8_t *outbuf, size_t outbuf_size, uint8_t even
 size_t build_keep_alive_packet(uint8_t *outbuf, size_t outbuf_size, int64_t keep_alive_id);
 size_t build_brand_packet(uint8_t *outbuf, size_t outbuf_size, const char *brand_name);
 size_t build_game_rules_packet(uint8_t *outbuf, size_t outbuf_size, const game_rules_t *rules);
+size_t build_spawn_experience_orb_packet(uint8_t *outbuf,
+										 size_t outbuf_size,
+										 int32_t entity_id,
+										 double x,
+										 double y,
+										 double z,
+										 int16_t count);
+size_t build_entity_destroy_packet(uint8_t *outbuf,
+								   size_t outbuf_size,
+								   const int32_t *entity_ids,
+								   size_t entity_count);
+size_t build_spawn_entity_packet(uint8_t *outbuf,
+                                 size_t outbuf_size,
+                                 int32_t entity_id,
+                                 int32_t entity_type,
+                                 double x,
+                                 double y,
+                                 double z,
+                                 int8_t pitch,
+                                 int8_t yaw,
+                                 int8_t head_yaw,
+                                 int32_t data);
 
 #endif
