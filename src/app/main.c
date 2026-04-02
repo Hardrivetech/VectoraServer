@@ -57,8 +57,14 @@ static int g_log_chunk_sends = 1;
 #define PLAY774_C2S_CHAT_COMMAND_SIGNED 0x07
 #define PLAY774_C2S_CHAT_MESSAGE        0x08
 #define PLAY774_S2C_SYSTEM_CHAT         0x77
+#define CHAT_RATE_MAX_MESSAGES          5
+#define CHAT_RATE_WINDOW_SECONDS        3
+#define CHAT_RATE_BLOCK_BASE_SECONDS    10
+#define CHAT_RATE_BLOCK_MAX_SECONDS     120
+#define CHAT_RATE_STRIKE_DECAY_SECONDS  300
 
 static socket_handle_t g_play_chat_sockets[MAX_PLAY_CHAT_SOCKETS];
+static char g_play_chat_socket_usernames[MAX_PLAY_CHAT_SOCKETS][32];
 static size_t g_play_chat_socket_count = 0;
 static char g_muted_usernames[MAX_MUTED_PLAYERS][32];
 static size_t g_muted_username_count = 0;
@@ -155,6 +161,11 @@ typedef struct {
     int32_t spawned_entity_ids[256];
     int32_t spawned_entity_types[256];
     size_t spawned_entity_count;
+    time_t chat_rate_window_start;
+    int chat_rate_message_count;
+    time_t chat_rate_block_until;
+    int chat_rate_strike_count;
+    time_t chat_rate_last_violation;
 } client_session_t;
 
 static int track_spawned_entity_id(client_session_t *session, int32_t entity_id, int32_t entity_type) {
@@ -604,19 +615,190 @@ static void append_moderation_audit(const char *actor,
     fclose(fp);
 }
 
-static void register_play_chat_socket(socket_handle_t socket_fd) {
+#define MODLOG_SCAN_BUF  16384
+#define MODLOG_MAX_LINES 200
+
+/* Forward declaration — defined later in this file */
+static void send_system_chat_message(socket_handle_t socket_fd,
+                                     const char *message,
+                                     int overlay);
+
+static void send_modlog_to_player(socket_handle_t socket_fd, int count) {
+    FILE   *fp;
+    long    file_size, seek_pos, actual_read;
+    char   *buf;
+    char   *all_lines[MODLOG_MAX_LINES];
+    int     nlines     = 0;
+    char   *p, *line_start;
+    int     send_from, i;
+    char    msg[300];
+
+    if (count < 1)  count = 10;
+    if (count > 20) count = 20;
+
+    fp = fopen(MOD_AUDIT_LOG_FILE_PATH, "rb");
+    if (fp == NULL) {
+        send_system_chat_message(socket_fd, "[MOD] No audit log found.", 0);
+        return;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    file_size = ftell(fp);
+    if (file_size <= 0) {
+        fclose(fp);
+        send_system_chat_message(socket_fd, "[MOD] Audit log is empty.", 0);
+        return;
+    }
+
+    seek_pos    = (file_size > MODLOG_SCAN_BUF) ? (file_size - MODLOG_SCAN_BUF) : 0;
+    actual_read = file_size - seek_pos;
+    fseek(fp, seek_pos, SEEK_SET);
+
+    buf = (char *)malloc((size_t)(actual_read + 1));
+    if (buf == NULL) {
+        fclose(fp);
+        send_system_chat_message(socket_fd, "[MOD] Memory error.", 0);
+        return;
+    }
+    actual_read = (long)fread(buf, 1, (size_t)actual_read, fp);
+    fclose(fp);
+    buf[actual_read] = '\0';
+
+    /* Null-terminate each line and collect pointers */
+    p         = buf;
+    line_start = buf;
+    while (*p != '\0') {
+        if (*p == '\n') {
+            *p = '\0';
+            if (p > buf && *(p - 1) == '\r') *(p - 1) = '\0';
+            if (*line_start != '\0' && nlines < MODLOG_MAX_LINES) {
+                all_lines[nlines++] = line_start;
+            }
+            line_start = p + 1;
+        }
+        ++p;
+    }
+    /* Last line without trailing newline */
+    if (*line_start != '\0' && nlines < MODLOG_MAX_LINES) {
+        all_lines[nlines++] = line_start;
+    }
+
+    if (nlines == 0) {
+        free(buf);
+        send_system_chat_message(socket_fd, "[MOD] Audit log is empty.", 0);
+        return;
+    }
+
+    send_from = nlines - count;
+    if (send_from < 0) send_from = 0;
+
+    snprintf(msg, sizeof(msg), "[MOD] Last %d audit log %s:",
+             nlines - send_from, (nlines - send_from == 1) ? "entry" : "entries");
+    send_system_chat_message(socket_fd, msg, 0);
+
+    for (i = send_from; i < nlines; ++i) {
+        snprintf(msg, sizeof(msg), "%s", all_lines[i]);
+        send_system_chat_message(socket_fd, msg, 0);
+    }
+    free(buf);
+}
+
+static int record_chat_message_and_check_limit(client_session_t *session,
+                                               time_t now,
+                                               int *seconds_left) {
+    int block_seconds;
+    char audit_detail[96];
+
+    if (session == NULL) {
+        return 1;
+    }
+
+    if (seconds_left != NULL) {
+        *seconds_left = 0;
+    }
+
+    if (session->chat_rate_block_until > now) {
+        if (seconds_left != NULL) {
+            *seconds_left = (int)(session->chat_rate_block_until - now);
+        }
+        return 0;
+    }
+
+    if (session->chat_rate_window_start == 0 ||
+        (now - session->chat_rate_window_start) >= CHAT_RATE_WINDOW_SECONDS) {
+        session->chat_rate_window_start = now;
+        session->chat_rate_message_count = 0;
+    }
+
+    session->chat_rate_message_count += 1;
+    if (session->chat_rate_message_count > CHAT_RATE_MAX_MESSAGES) {
+        if (session->chat_rate_last_violation == 0 ||
+            (now - session->chat_rate_last_violation) >= CHAT_RATE_STRIKE_DECAY_SECONDS) {
+            session->chat_rate_strike_count = 0;
+        }
+
+        if (session->chat_rate_strike_count < 30) {
+            session->chat_rate_strike_count += 1;
+        }
+
+        block_seconds = CHAT_RATE_BLOCK_BASE_SECONDS;
+        if (session->chat_rate_strike_count > 1) {
+            int shift = session->chat_rate_strike_count - 1;
+            if (shift > 6) {
+                shift = 6;
+            }
+            block_seconds <<= shift;
+        }
+        if (block_seconds > CHAT_RATE_BLOCK_MAX_SECONDS) {
+            block_seconds = CHAT_RATE_BLOCK_MAX_SECONDS;
+        }
+
+        session->chat_rate_last_violation = now;
+        session->chat_rate_block_until = now + block_seconds;
+        session->chat_rate_window_start = now;
+        session->chat_rate_message_count = 0;
+        if (seconds_left != NULL) {
+            *seconds_left = block_seconds;
+        }
+
+        snprintf(audit_detail,
+                 sizeof(audit_detail),
+                 "temporary mute %ds strike=%d",
+                 block_seconds,
+                 session->chat_rate_strike_count);
+        append_moderation_audit(session->username,
+                                "CHAT_RATE_LIMIT",
+                                "-",
+                                audit_detail);
+        return 0;
+    }
+
+    return 1;
+}
+
+static void register_play_chat_socket(socket_handle_t socket_fd, const char *username) {
     size_t i;
 
     PLAY_CHAT_LOCK();
     for (i = 0; i < g_play_chat_socket_count; ++i) {
         if (g_play_chat_sockets[i] == socket_fd) {
+            snprintf(g_play_chat_socket_usernames[i],
+                     sizeof(g_play_chat_socket_usernames[i]),
+                     "%s",
+                     (username != NULL && username[0] != '\0') ? username : "Player");
             PLAY_CHAT_UNLOCK();
             return;
         }
     }
 
     if (g_play_chat_socket_count < MAX_PLAY_CHAT_SOCKETS) {
-        g_play_chat_sockets[g_play_chat_socket_count++] = socket_fd;
+        size_t idx = g_play_chat_socket_count;
+        g_play_chat_sockets[idx] = socket_fd;
+        snprintf(g_play_chat_socket_usernames[idx],
+                 sizeof(g_play_chat_socket_usernames[idx]),
+                 "%s",
+                 (username != NULL && username[0] != '\0') ? username : "Player");
+        g_play_chat_socket_count += 1;
     }
     PLAY_CHAT_UNLOCK();
 }
@@ -632,6 +814,9 @@ static void unregister_play_chat_socket(socket_handle_t socket_fd) {
                 memmove(&g_play_chat_sockets[i],
                         &g_play_chat_sockets[i + 1],
                         tail * sizeof(g_play_chat_sockets[0]));
+                memmove(&g_play_chat_socket_usernames[i],
+                        &g_play_chat_socket_usernames[i + 1],
+                        tail * sizeof(g_play_chat_socket_usernames[0]));
             }
             g_play_chat_socket_count -= 1;
             break;
@@ -1567,6 +1752,52 @@ static void broadcast_system_chat_message(const char *text, int overlay) {
     }
 }
 
+static void broadcast_moderator_system_message(const char *text, int overlay) {
+    socket_handle_t sockets[MAX_PLAY_CHAT_SOCKETS];
+    char usernames[MAX_PLAY_CHAT_SOCKETS][32];
+    char moderators[MAX_MODERATORS][32];
+    size_t socket_count = 0;
+    size_t moderator_count = 0;
+    size_t i;
+
+    if (text == NULL) {
+        return;
+    }
+
+    PLAY_CHAT_LOCK();
+    socket_count = g_play_chat_socket_count;
+    if (socket_count > MAX_PLAY_CHAT_SOCKETS) {
+        socket_count = MAX_PLAY_CHAT_SOCKETS;
+    }
+    memcpy(sockets, g_play_chat_sockets, socket_count * sizeof(sockets[0]));
+    memcpy(usernames,
+           g_play_chat_socket_usernames,
+           socket_count * sizeof(usernames[0]));
+
+    moderator_count = g_moderator_username_count;
+    if (moderator_count > MAX_MODERATORS) {
+        moderator_count = MAX_MODERATORS;
+    }
+    memcpy(moderators,
+           g_moderator_usernames,
+           moderator_count * sizeof(moderators[0]));
+    PLAY_CHAT_UNLOCK();
+
+    for (i = 0; i < socket_count; ++i) {
+        size_t j;
+        int is_mod = 0;
+        for (j = 0; j < moderator_count; ++j) {
+            if (username_equals_ci(usernames[i], moderators[j])) {
+                is_mod = 1;
+                break;
+            }
+        }
+        if (is_mod) {
+            send_system_chat_message(sockets[i], text, overlay);
+        }
+    }
+}
+
 static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_t *packet, size_t packet_len) {
     uint8_t framed[8192];
     size_t framed_len = double_frame_packet(framed, packet, packet_len);
@@ -1738,7 +1969,7 @@ static void run_play_state_loop(client_session_t *session,
         uint64_t play_packets_parsed = 0;
         uint64_t play_packets_parse_failed = 0;
         increment_connected_play_sessions();
-        register_play_chat_socket(socket_fd);
+        register_play_chat_socket(socket_fd, session->username);
         if (ensure_initial_moderator(session->username)) {
             char mod_msg[128];
             snprintf(mod_msg,
@@ -2038,6 +2269,7 @@ static void run_play_state_loop(client_session_t *session,
                                 send_system_chat_message(socket_fd, "Commands: /despawn <entity_id>, /despawnall, /listentities", 0);
                                 send_system_chat_message(socket_fd, "Commands: /mute <player>, /unmute <player>, /mutelist", 0);
                                 send_system_chat_message(socket_fd, "Commands: /op <player>, /deop <player>, /modlist", 0);
+                                send_system_chat_message(socket_fd, "Commands: /modlog [count]  (show last audit log entries, mod-only)", 0);
                                 send_system_chat_message(socket_fd, "Examples: /spawn cow 5 4 0 glow ; /despawnall", 0);
                                 handled = 1;
                             } else if (command_equals(command_text, "listentities")) {
@@ -2223,6 +2455,22 @@ static void run_play_state_loop(client_session_t *session,
                                         }
                                     }
                                     handled = 1;
+                                } else if (command_equals(command_text, "modlog") ||
+                                           command_extract_single_arg(command_text, "modlog", target_name, sizeof(target_name))) {
+                                    if (!sender_is_mod) {
+                                        send_system_chat_message(socket_fd, "[MOD] You do not have permission to use /modlog.", 0);
+                                    } else {
+                                        int log_count = 10;
+                                        /* target_name holds the optional numeric arg if any */
+                                        if (target_name[0] != '\0') {
+                                            int parsed = 0;
+                                            if (sscanf(target_name, "%d", &parsed) == 1 && parsed > 0) {
+                                                log_count = parsed;
+                                            }
+                                        }
+                                        send_modlog_to_player(socket_fd, log_count);
+                                    }
+                                    handled = 1;
                                 }
                             }
 
@@ -2395,9 +2643,34 @@ static void run_play_state_loop(client_session_t *session,
                                         }
                                     } else if (play_pid == PLAY774_C2S_CHAT_MESSAGE) {
                                         const char *sender_name = session->username[0] ? session->username : "Player";
+                                        int block_chat = 0;
                                         if (is_username_muted(sender_name)) {
                                             send_system_chat_message(socket_fd, "[MOD] You are muted.", 0);
+                                            block_chat = 1;
                                         } else {
+                                            int cooldown_left = 0;
+                                            if (!record_chat_message_and_check_limit(session, time(NULL), &cooldown_left)) {
+                                                char feedback[160];
+                                                snprintf(feedback,
+                                                         sizeof(feedback),
+                                                         "[MOD] Chat slow mode: wait %d second(s).",
+                                                         cooldown_left > 0 ? cooldown_left : 1);
+                                                send_system_chat_message(socket_fd, feedback, 0);
+                                                if (session->chat_rate_strike_count >= 3) {
+                                                    char alert[224];
+                                                    snprintf(alert,
+                                                             sizeof(alert),
+                                                             "[MOD ALERT] %s hit spam strike %d (cooldown %ds).",
+                                                             sender_name,
+                                                             session->chat_rate_strike_count,
+                                                             cooldown_left > 0 ? cooldown_left : 1);
+                                                    broadcast_moderator_system_message(alert, 0);
+                                                }
+                                                block_chat = 1;
+                                            }
+                                        }
+
+                                        if (!block_chat) {
                                             char feedback[320];
                                             snprintf(feedback,
                                                      sizeof(feedback),
@@ -2406,6 +2679,7 @@ static void run_play_state_loop(client_session_t *session,
                                                      command_text);
                                             broadcast_system_chat_message(feedback, 0);
                                         }
+                                        handled = 1;
                                     } else if (play_pid == PLAY774_C2S_CHAT_COMMAND ||
                                                play_pid == PLAY774_C2S_CHAT_COMMAND_SIGNED) {
                                         char feedback[224];
