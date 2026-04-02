@@ -270,8 +270,16 @@ static int assign_config_value(server_config_t *config, const char *key, const c
         config->send_brand_packet = parsed;
         return 1;
     }
+    if (strcmp(key, "send_game_rules_packet") == 0) {
+        config->send_game_rules_packet = parsed;
+        return 1;
+    }
     if (strcmp(key, "send_wait_for_level_chunks_event") == 0) {
         config->send_wait_for_level_chunks_event = parsed;
+        return 1;
+    }
+    if (strcmp(key, "reject_protocol_mismatch") == 0) {
+        config->reject_protocol_mismatch = parsed;
         return 1;
     }
     if (strcmp(key, "log_packet_framing") == 0) {
@@ -367,13 +375,15 @@ void set_server_config_defaults(server_config_t *config) {
     config->enable_real_chunks = 1;
     config->allow_debug_chunk_fallback = 1;
     config->send_brand_packet = 1;
+    config->send_game_rules_packet = 0;
     config->send_wait_for_level_chunks_event = 1;
+    config->reject_protocol_mismatch = 1;
     config->log_packet_framing = 1;
     config->log_play_packets = 0;
     config->log_chunk_sends = 1;
     config->offline_mode = 1;
     snprintf(config->server_brand, sizeof(config->server_brand), "%s", "Vectora");
-    snprintf(config->protocol_name, sizeof(config->protocol_name), "%s", "Vectora 1.20.x");
+    snprintf(config->protocol_name, sizeof(config->protocol_name), "%s", "Vectora 1.21.11");
     snprintf(config->motd, sizeof(config->motd), "%s", "Welcome to Vectora!");
     config->world_path[0] = '\0';
 }

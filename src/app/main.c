@@ -99,6 +99,7 @@ typedef struct {
     socket_handle_t socket_fd;
     socket_handle_t server_fd;
     server_config_t server_config;
+    int32_t client_protocol_version;
     client_stream_state_t stream_state;
 } client_session_t;
 
@@ -468,6 +469,31 @@ static int send_all(socket_handle_t socket_fd, const uint8_t *buf, size_t len) {
     return 1;
 }
 
+static size_t write_mc_string_raw(uint8_t *dst, const char *text) {
+    size_t text_len = strlen(text);
+    size_t offset = 0;
+    offset += write_varint(dst + offset, (int32_t)text_len);
+    memcpy(dst + offset, text, text_len);
+    offset += text_len;
+    return offset;
+}
+
+static void send_login_disconnect(socket_handle_t socket_fd, const char *reason_json) {
+    uint8_t packet[512];
+    uint8_t framed[520];
+    size_t packet_len = 0;
+    size_t framed_len = 0;
+
+    packet_len += write_varint(packet + packet_len, 0x00);
+    packet_len += write_mc_string_raw(packet + packet_len, reason_json);
+
+    framed_len += write_varint(framed + framed_len, (int32_t)packet_len);
+    memcpy(framed + framed_len, packet, packet_len);
+    framed_len += packet_len;
+
+    (void)send_all(socket_fd, framed, framed_len);
+}
+
 static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_t *packet, size_t packet_len) {
     uint8_t framed[8192];
     size_t framed_len = double_frame_packet(framed, packet, packet_len);
@@ -532,6 +558,7 @@ static void close_client_socket(socket_handle_t socket_fd) {
 
 static int parse_handshake_next_state(const uint8_t *buffer,
                                       size_t bytes_read,
+                                      int32_t *out_protocol_version,
                                       int32_t *out_next_state) {
     const uint8_t *ptr = buffer;
     size_t buflen = bytes_read;
@@ -540,6 +567,7 @@ static int parse_handshake_next_state(const uint8_t *buffer,
 
     printf("Received packet: length=%d, id=%d\n", packet_length, packet_id);
     if (packet_id != 0x00) {
+        *out_protocol_version = -1;
         *out_next_state = -1;
         return 0;
     }
@@ -551,6 +579,7 @@ static int parse_handshake_next_state(const uint8_t *buffer,
         uint16_t server_port = (uint16_t)(ptr[0] << 8 | ptr[1]);
         ptr += 2;
         buflen -= 2;
+        *out_protocol_version = protocol_version;
         *out_next_state = read_varint(&ptr, &buflen);
         printf("Handshake: proto=%d, addr=%s, port=%u, next_state=%d\n", protocol_version, server_address, server_port, *out_next_state);
         free(server_address);
@@ -772,11 +801,14 @@ static void handle_client_connection(client_session_t *session) {
     }
 
     {
+        int32_t protocol_version = -1;
         int32_t next_state = -1;
-        if (!parse_handshake_next_state(buffer, (size_t)bytes_read, &next_state)) {
+        if (!parse_handshake_next_state(buffer, (size_t)bytes_read, &protocol_version, &next_state)) {
             close_client_socket(new_socket);
             return;
         }
+
+        session->client_protocol_version = protocol_version;
 
         if (next_state == 1) {
             handle_status_state(new_socket, &server_config);
@@ -823,6 +855,23 @@ static void handle_client_connection(client_session_t *session) {
                     return;
                 }
                 printf("Login Start: username=%s\n", username);
+
+                if (server_config.reject_protocol_mismatch &&
+                    session->client_protocol_version != server_config.protocol_number) {
+                    char reason_json[256];
+                    snprintf(reason_json,
+                             sizeof(reason_json),
+                             "{\"text\":\"Unsupported protocol %d. This server expects protocol %d.\"}",
+                             session->client_protocol_version,
+                             server_config.protocol_number);
+                    send_login_disconnect(new_socket, reason_json);
+                    printf("Rejected client due to protocol mismatch (client=%d, configured=%d).\n",
+                           session->client_protocol_version,
+                           server_config.protocol_number);
+                    free(username);
+                    close_client_socket(new_socket);
+                    return;
+                }
 
 
                 // Send Set Compression packet (id 0x03, Login state)
@@ -1465,12 +1514,17 @@ static void handle_client_connection(client_session_t *session) {
                                                 printf("Sent Update Time.\n");
                                             }
 
-                                            // Send Game Rules (after chunk operations) - TEMPORARILY DISABLED due to protocol issue
-                                            if (0) {
+                                            // Send Game Rules only when explicitly enabled and the client matches the configured protocol.
+                                            if (server_config.send_game_rules_packet &&
+                                                session->client_protocol_version == server_config.protocol_number) {
                                                 uint8_t game_rules_buf[4096];
                                                 size_t game_rules_len = build_game_rules_packet(game_rules_buf, sizeof(game_rules_buf), &server_config.game_rules);
                                                 send_post_compression_packet(new_socket, game_rules_buf, game_rules_len);
                                                 printf("Sent Game Rules packet (%zu bytes).\n", game_rules_len);
+                                            } else if (server_config.send_game_rules_packet) {
+                                                printf("Skipped Game Rules packet due to protocol mismatch (client=%d, configured=%d).\n",
+                                                       session->client_protocol_version,
+                                                       server_config.protocol_number);
                                             }
 
                                             // Player Position and Look

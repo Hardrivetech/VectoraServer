@@ -31,7 +31,9 @@ typedef struct {
     int enable_real_chunks;
     int allow_debug_chunk_fallback;
     int send_brand_packet;
+    int send_game_rules_packet;
     int send_wait_for_level_chunks_event;
+    int reject_protocol_mismatch;
     int log_packet_framing;
     int log_play_packets;
     int log_chunk_sends;
