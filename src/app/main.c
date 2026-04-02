@@ -792,12 +792,18 @@ static void run_play_state_loop(client_session_t *session,
         time_t last_keepalive = time(NULL);
         time_t last_client_activity = time(NULL);
         time_t last_entity_event_log = time(NULL);
-        time_t last_mock_entity_update = time(NULL);
         double last_activity_x = 0.0;
         double last_activity_z = 0.0;
         int has_last_activity_position = 0;
         int64_t ka_id = 1;
+        uint64_t tick = 0;  /* Game tick counter for deterministic entity updates */
         for (;;) {
+            #ifdef _WIN32
+            Sleep(50);  /* 50ms = 20 TPS (ticks per second) */
+            #else
+            usleep(50000);  /* 50ms = 20 TPS */
+            #endif
+            tick++;
             // Send Keep Alive on the configured interval.
             time_t now = time(NULL);
             if (now - last_keepalive >= session->server_config.keep_alive_interval_seconds) {
@@ -819,14 +825,29 @@ static void run_play_state_loop(client_session_t *session,
             if (session->server_config.enable_experimental_entities &&
                 session->mock_entity_a != 0 &&
                 session->mock_entity_b != 0 &&
-                now - last_mock_entity_update >= 1) {
+                tick % 1 == 0) {  /* Update every tick (20 TPS) */
                 double anchor_x = has_last_activity_position ? last_activity_x : 0.5;
                 double anchor_z = has_last_activity_position ? last_activity_z : 0.5;
-                double phase = (double)(now % 60) * 0.20;
+                double phase = (tick % 1200) * 0.005236;  /* 1200 ticks = 60s, smooth cycle */
                 double ax = anchor_x + 2.0 + sin(phase) * 0.75;
                 double az = anchor_z + 1.0 + cos(phase) * 0.75;
                 double bx = anchor_x - 2.0 + cos(phase * 0.9) * 0.75;
                 double bz = anchor_z - 1.0 + sin(phase * 0.9) * 0.75;
+
+                /* Capture old positions before the registry is updated. */
+                double old_ax = ax, old_ay = 0.0, old_az = az;
+                double old_bx = bx, old_by = 0.0, old_bz = bz;
+                {
+                    int i;
+                    for (i = 0; i < 512; ++i) {
+                        entity_state_t *e = &session->entity_registry.entries[i];
+                        if (e->active && e->entity_id == session->mock_entity_a) {
+                            old_ax = e->x; old_ay = e->y; old_az = e->z;
+                        } else if (e->active && e->entity_id == session->mock_entity_b) {
+                            old_bx = e->x; old_by = e->y; old_bz = e->z;
+                        }
+                    }
+                }
 
                 (void)entity_manager_queue_update_xz(&session->entity_registry,
                                                      &session->entity_manager,
@@ -838,7 +859,67 @@ static void run_play_state_loop(client_session_t *session,
                                                      session->mock_entity_b,
                                                      bx,
                                                      bz);
-                last_mock_entity_update = now;
+
+                if (session->server_config.enable_experimental_entity_packets &&
+                    session->client_protocol_version == 774) {
+                    /* Delta encoding: (new - old) * 4096, clamped to int16_t range.
+                     * Orbit is XZ only; Y does not change, so dy is always 0.
+                     * If any axis exceeds ±8 blocks (±32767 units) use position sync instead. */
+                    double da_raw_x = (ax - old_ax) * 4096.0;
+                    double da_raw_y = 0.0;
+                    double da_raw_z = (az - old_az) * 4096.0;
+                    double db_raw_x = (bx - old_bx) * 4096.0;
+                    double db_raw_y = 0.0;
+                    double db_raw_z = (bz - old_bz) * 4096.0;
+
+#define ENTITY_DELTA_FITS(v) ((v) >= -32767.0 && (v) <= 32767.0)
+                    uint8_t mv_buf[64];
+                    size_t mv_len;
+
+                    if (ENTITY_DELTA_FITS(da_raw_x) && ENTITY_DELTA_FITS(da_raw_y) && ENTITY_DELTA_FITS(da_raw_z)) {
+                        mv_len = build_move_entity_pos_packet(mv_buf, sizeof(mv_buf),
+                            session->mock_entity_a,
+                            (int16_t)da_raw_x, (int16_t)da_raw_y, (int16_t)da_raw_z, 0);
+                    } else {
+                        mv_len = build_entity_position_sync_packet(mv_buf, sizeof(mv_buf),
+                            session->mock_entity_a, ax, old_ay, az, 0.0, 0.0, 0.0, 0.0f, 0.0f, 0);
+                    }
+                    send_post_compression_packet(socket_fd, mv_buf, mv_len);
+
+                    if (ENTITY_DELTA_FITS(db_raw_x) && ENTITY_DELTA_FITS(db_raw_y) && ENTITY_DELTA_FITS(db_raw_z)) {
+                        mv_len = build_move_entity_pos_packet(mv_buf, sizeof(mv_buf),
+                            session->mock_entity_b,
+                            (int16_t)db_raw_x, (int16_t)db_raw_y, (int16_t)db_raw_z, 0);
+                    } else {
+                        mv_len = build_entity_position_sync_packet(mv_buf, sizeof(mv_buf),
+                            session->mock_entity_b, bx, old_by, bz, 0.0, 0.0, 0.0, 0.0f, 0.0f, 0);
+                    }
+                    send_post_compression_packet(socket_fd, mv_buf, mv_len);
+
+                    /* Head Rotation (0x51) — make entities look at player
+                     * yaw = -atan2(dx, dz) * 180 / PI, where dx/dz are deltas from entity to player */
+                    {
+                        double player_x = has_last_activity_position ? last_activity_x : 0.5;
+                        double player_z = has_last_activity_position ? last_activity_z : 0.5;
+                        double dx_a = player_x - ax;
+                        double dz_a = player_z - az;
+                        double head_yaw_a = -atan2(dx_a, dz_a) * 180.0 / 3.14159265359;
+                        if (head_yaw_a < 0.0) head_yaw_a += 360.0;  /* Ensure 0-360 range */
+                        uint8_t hr_buf[16];
+                        size_t hr_len = build_set_head_rotation_packet(hr_buf, sizeof(hr_buf),
+                                                                       session->mock_entity_a, (float)head_yaw_a);
+                        send_post_compression_packet(socket_fd, hr_buf, hr_len);
+
+                        double dx_b = player_x - bx;
+                        double dz_b = player_z - bz;
+                        double head_yaw_b = -atan2(dx_b, dz_b) * 180.0 / 3.14159265359;
+                        if (head_yaw_b < 0.0) head_yaw_b += 360.0;
+                        hr_len = build_set_head_rotation_packet(hr_buf, sizeof(hr_buf),
+                                                                session->mock_entity_b, (float)head_yaw_b);
+                        send_post_compression_packet(socket_fd, hr_buf, hr_len);
+                    }
+#undef ENTITY_DELTA_FITS
+                }
             }
 
             if (session->server_config.play_idle_timeout_seconds > 0 &&
@@ -1273,7 +1354,7 @@ static void handle_client_connection(client_session_t *session) {
                                 config_replay_t replay;
                                 const char *replay_path = NULL;
                                 int have_replay;
-                                uint8_t cfg_buf[1024]; // 1024 to accommodate damage_type (25 entries ~548 bytes)
+                                uint8_t cfg_buf[2048]; // 2048 to accommodate damage_type (50 entries ~1400 bytes)
                                 size_t cfg_len;
                                 uint8_t double_framed[2048];
                                 size_t double_framed_len;
@@ -1909,15 +1990,14 @@ static void handle_client_connection(client_session_t *session) {
                                                         if (server_config.enable_experimental_entity_packets &&
                                                             session->client_protocol_version == 774) {
                                                             // Send Spawn Entity (0x01) for both mock entities.
-                                                            // Entity type 2 = armor_stand (placeholder — verify against
-                                                            // minecraft:entity_type registry for protocol 774).
+                                                            // Entity type 5 = armor_stand (protocol 774 registry ID).
                                                             uint8_t se_buf[128];
                                                             size_t se_len;
 
                                                             se_len = build_spawn_entity_packet(
                                                                 se_buf, sizeof(se_buf),
                                                                 mock_a,
-                                                                2, // entity type: armor_stand placeholder
+                                                                5, // entity type: armor_stand (protocol 774 ID)
                                                                 (double)player_spawn_x + 2.0,
                                                                 (double)player_spawn_y,
                                                                 (double)player_spawn_z + 1.0,
@@ -1927,12 +2007,21 @@ static void handle_client_connection(client_session_t *session) {
                                                             se_len = build_spawn_entity_packet(
                                                                 se_buf, sizeof(se_buf),
                                                                 mock_b,
-                                                                2, // entity type: armor_stand placeholder
+                                                                5, // entity type: armor_stand (protocol 774 ID)
                                                                 (double)player_spawn_x - 2.0,
                                                                 (double)player_spawn_y,
                                                                 (double)player_spawn_z - 1.0,
                                                                 0, 0, 0, 0);
                                                             send_post_compression_packet(new_socket, se_buf, se_len);
+
+                                                            {
+                                                                uint8_t md_buf[32];
+                                                                size_t md_len;
+                                                                md_len = build_set_entity_glowing_packet(md_buf, sizeof(md_buf), mock_a, 1);
+                                                                send_post_compression_packet(new_socket, md_buf, md_len);
+                                                                md_len = build_set_entity_glowing_packet(md_buf, sizeof(md_buf), mock_b, 1);
+                                                                send_post_compression_packet(new_socket, md_buf, md_len);
+                                                            }
 
                                                             printf("Sent Spawn Entity for mock entities %d and %d.\n", mock_a, mock_b);
                                                         }

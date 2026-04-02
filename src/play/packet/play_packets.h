@@ -34,5 +34,32 @@ size_t build_spawn_entity_packet(uint8_t *outbuf,
                                  int8_t yaw,
                                  int8_t head_yaw,
                                  int32_t data);
+size_t build_move_entity_pos_packet(uint8_t *outbuf,
+                                    size_t outbuf_size,
+                                    int32_t entity_id,
+                                    int16_t dx,
+                                    int16_t dy,
+                                    int16_t dz,
+                                    int on_ground);
+size_t build_entity_position_sync_packet(uint8_t *outbuf,
+                                         size_t outbuf_size,
+                                         int32_t entity_id,
+                                         double x,
+                                         double y,
+                                         double z,
+                                         double vx,
+                                         double vy,
+                                         double vz,
+                                         float yaw,
+                                         float pitch,
+                                         int on_ground);
+size_t build_set_head_rotation_packet(uint8_t *outbuf,
+                                      size_t outbuf_size,
+                                      int32_t entity_id,
+                                      float head_yaw);
+size_t build_set_entity_glowing_packet(uint8_t *outbuf,
+                                       size_t outbuf_size,
+                                       int32_t entity_id,
+                                       int glowing);
 
 #endif

@@ -139,9 +139,13 @@ size_t build_registry_data_biome_packet(uint8_t *outbuf, size_t outbuf_size) {
 }
 
 size_t build_registry_data_damage_type(uint8_t *outbuf, size_t outbuf_size) {
-    // Registry Data 0x07: minecraft:damage_type, all 25 entries required by the client
-    // before it accepts a Login (play) packet. Data absent — sourced from core pack.
+    // Registry Data 0x07: minecraft:damage_type — complete entry list for 1.21.11 (protocol 774).
+    // All entries use data-absent (0x00): client loads NBT from its built-in core data pack.
+    // The server must declare every entry it wants the client to recognise; unlisted entries
+    // are unavailable even if they exist in the vanilla pack, causing crashes on lookup.
     static const char *entries[] = {
+        "minecraft:arrow",
+        "minecraft:bad_respawn_point",
         "minecraft:cactus",
         "minecraft:campfire",
         "minecraft:cramming",
@@ -149,7 +153,13 @@ size_t build_registry_data_damage_type(uint8_t *outbuf, size_t outbuf_size) {
         "minecraft:drown",
         "minecraft:dry_out",
         "minecraft:ender_pearl",
+        "minecraft:explosion",
         "minecraft:fall",
+        "minecraft:falling_anvil",
+        "minecraft:falling_block",
+        "minecraft:falling_stalactite",
+        "minecraft:fireball",
+        "minecraft:fireworks",
         "minecraft:fly_into_wall",
         "minecraft:freeze",
         "minecraft:generic",
@@ -157,19 +167,36 @@ size_t build_registry_data_damage_type(uint8_t *outbuf, size_t outbuf_size) {
         "minecraft:hot_floor",
         "minecraft:in_fire",
         "minecraft:in_wall",
+        "minecraft:indirect_magic",
         "minecraft:lava",
         "minecraft:lightning_bolt",
+        "minecraft:mace_smash",
         "minecraft:magic",
+        "minecraft:mob_attack",
+        "minecraft:mob_attack_no_aggro",
+        "minecraft:mob_projectile",
         "minecraft:on_fire",
         "minecraft:out_of_world",
         "minecraft:outside_border",
+        "minecraft:player_attack",
+        "minecraft:player_explosion",
+        "minecraft:sonic_boom",
+        "minecraft:spear",
+        "minecraft:spit",
         "minecraft:stalagmite",
         "minecraft:starve",
+        "minecraft:sting",
         "minecraft:sweet_berry_bush",
+        "minecraft:thorns",
+        "minecraft:thrown",
+        "minecraft:trident",
+        "minecraft:unattributed_fireball",
+        "minecraft:wind_charge",
         "minecraft:wither",
+        "minecraft:wither_skull",
     };
-    const int num_entries = 25;
-    uint8_t packet[1024];
+    const int num_entries = 50;
+    uint8_t packet[2048];
     size_t offset = 0;
     offset += write_varint(packet + offset, 0x07);
     offset += write_mc_string(packet + offset, "minecraft:damage_type");

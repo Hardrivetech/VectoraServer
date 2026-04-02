@@ -230,10 +230,12 @@ size_t build_spawn_entity_packet(uint8_t *outbuf,
     write_f64_be(outbuf + offset, y); offset += 8;
     write_f64_be(outbuf + offset, z); offset += 8;
 
-    // Velocity: LpVec3 (3 x signed short, units: 1/8000 blocks per tick). Zero = stationary.
-    write_i16_be(outbuf + offset, 0); offset += 2;
-    write_i16_be(outbuf + offset, 0); offset += 2;
-    write_i16_be(outbuf + offset, 0); offset += 2;
+    // Velocity: Optional<LpVec3> in protocol 774 (1.21.11).
+    // Format: bool (1 byte) — false = no velocity, true = Short×3 follows.
+    // Despite the wiki listing "LpVec3" (= Short×3), the actual wire format is optional.
+    // Confirmed from "5 bytes extra" DecoderException: client reads the first 0x00 byte as
+    // the boolean false flag, then reads angles + data, leaving 5 stray bytes.
+    outbuf[offset++] = 0x00; // hasVelocity = false (always zero for spawned mobs)
 
     // Angles: pitch, yaw, head_yaw (each 1 byte, 256 units = 360 degrees)
     outbuf[offset++] = (uint8_t)pitch;
@@ -242,6 +244,111 @@ size_t build_spawn_entity_packet(uint8_t *outbuf,
 
     // Data (VarInt): 0 for most entity types; arrows/fishing hooks use this for owner entity ID.
     offset += write_varint(outbuf + offset, data);
+
+    return offset;
+}
+
+// Update Entity Position (0x33 / move_entity_pos) — delta move ≤ 8 blocks.
+// Delta encoding: dx = (int16_t)((new_x - old_x) * 4096.0), same for dy and dz.
+// Max representable delta: ±8 blocks (32768 units, but Short wraps; use ≤7.999 in practice).
+// Use build_entity_position_sync_packet for moves exceeding this range.
+size_t build_move_entity_pos_packet(uint8_t *outbuf,
+                                    size_t outbuf_size,
+                                    int32_t entity_id,
+                                    int16_t dx,
+                                    int16_t dy,
+                                    int16_t dz,
+                                    int on_ground) {
+    size_t offset = 0;
+
+    (void)outbuf_size;
+
+    offset += write_varint(outbuf + offset, PLAY774_PKT_MOVE_ENTITY_POS);
+    offset += write_varint(outbuf + offset, entity_id);
+    write_i16_be(outbuf + offset, dx); offset += 2;
+    write_i16_be(outbuf + offset, dy); offset += 2;
+    write_i16_be(outbuf + offset, dz); offset += 2;
+    outbuf[offset++] = on_ground ? 1 : 0;
+
+    return offset;
+}
+
+// Teleport Entity / Entity Position Sync (0x23 / entity_position_sync) — authoritative
+// absolute position, used when the delta would exceed the ±8 block limit of 0x33.
+// Velocities are in blocks/tick (typically 0 for stationary mobs).
+size_t build_entity_position_sync_packet(uint8_t *outbuf,
+                                         size_t outbuf_size,
+                                         int32_t entity_id,
+                                         double x,
+                                         double y,
+                                         double z,
+                                         double vx,
+                                         double vy,
+                                         double vz,
+                                         float yaw,
+                                         float pitch,
+                                         int on_ground) {
+    size_t offset = 0;
+
+    (void)outbuf_size;
+
+    offset += write_varint(outbuf + offset, PLAY774_PKT_ENTITY_POSITION_SYNC);
+    offset += write_varint(outbuf + offset, entity_id);
+    write_f64_be(outbuf + offset, x);  offset += 8;
+    write_f64_be(outbuf + offset, y);  offset += 8;
+    write_f64_be(outbuf + offset, z);  offset += 8;
+    write_f64_be(outbuf + offset, vx); offset += 8;
+    write_f64_be(outbuf + offset, vy); offset += 8;
+    write_f64_be(outbuf + offset, vz); offset += 8;
+    write_f32_be(outbuf + offset, yaw);   offset += 4;
+    write_f32_be(outbuf + offset, pitch); offset += 4;
+    outbuf[offset++] = on_ground ? 1 : 0;
+
+    return offset;
+}
+
+// Set Head Rotation (0x51 / rotate_head) — rotates entity's head independently.
+// Head Yaw is encoded as a single byte where 256 units = 360 degrees.
+size_t build_set_head_rotation_packet(uint8_t *outbuf,
+                                      size_t outbuf_size,
+                                      int32_t entity_id,
+                                      float head_yaw) {
+    size_t offset = 0;
+
+    (void)outbuf_size;
+
+    offset += write_varint(outbuf + offset, PLAY774_PKT_SET_HEAD_ROTATION);
+    offset += write_varint(outbuf + offset, entity_id);
+
+    // Convert yaw in degrees (0-360) to angle byte (0-255).
+    // head_yaw is in degrees; multiply by 256/360 to get byte value.
+    uint8_t angle_byte = (uint8_t)(((head_yaw / 360.0f) * 256.0f));
+    outbuf[offset++] = angle_byte;
+
+    return offset;
+}
+
+// Set Entity Metadata (0x61 / set_entity_data) for base entity flags.
+// This helper updates metadata index 0 (Byte bitmask) to toggle glowing.
+size_t build_set_entity_glowing_packet(uint8_t *outbuf,
+                                       size_t outbuf_size,
+                                       int32_t entity_id,
+                                       int glowing) {
+    size_t offset = 0;
+    uint8_t flags = glowing ? 0x40 : 0x00;
+
+    (void)outbuf_size;
+
+    offset += write_varint(outbuf + offset, PLAY774_PKT_SET_ENTITY_METADATA);
+    offset += write_varint(outbuf + offset, entity_id);
+
+    // Metadata entry: index=0 (entity flags), type=0 (Byte), value=flags.
+    outbuf[offset++] = 0x00;
+    offset += write_varint(outbuf + offset, 0);
+    outbuf[offset++] = flags;
+
+    // Metadata terminator.
+    outbuf[offset++] = 0xFF;
 
     return offset;
 }
