@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <time.h>
 #include <math.h>
 #include "protocol.h"
@@ -20,6 +21,7 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 typedef SOCKET socket_handle_t;
@@ -44,6 +46,45 @@ static int compression_threshold = 256; // Match Set Compression threshold
 static int g_log_packet_framing = 1;
 static int g_log_play_packets = 0;
 static int g_log_chunk_sends = 1;
+#define MAX_PLAY_CHAT_SOCKETS 128
+#define MAX_MUTED_PLAYERS 128
+#define MAX_MODERATORS 64
+
+#define PLAY774_C2S_CHAT_COMMAND        0x06
+#define PLAY774_C2S_CHAT_COMMAND_SIGNED 0x07
+#define PLAY774_C2S_CHAT_MESSAGE        0x08
+#define PLAY774_S2C_SYSTEM_CHAT         0x77
+
+static socket_handle_t g_play_chat_sockets[MAX_PLAY_CHAT_SOCKETS];
+static size_t g_play_chat_socket_count = 0;
+static char g_muted_usernames[MAX_MUTED_PLAYERS][32];
+static size_t g_muted_username_count = 0;
+static char g_moderator_usernames[MAX_MODERATORS][32];
+static size_t g_moderator_username_count = 0;
+#ifdef _WIN32
+static CRITICAL_SECTION g_play_chat_lock;
+static int g_play_chat_lock_initialized = 0;
+static void init_play_chat_lock(void) {
+    if (!g_play_chat_lock_initialized) {
+        InitializeCriticalSection(&g_play_chat_lock);
+        g_play_chat_lock_initialized = 1;
+    }
+}
+static void destroy_play_chat_lock(void) {
+    if (g_play_chat_lock_initialized) {
+        DeleteCriticalSection(&g_play_chat_lock);
+        g_play_chat_lock_initialized = 0;
+    }
+}
+#define PLAY_CHAT_LOCK() EnterCriticalSection(&g_play_chat_lock)
+#define PLAY_CHAT_UNLOCK() LeaveCriticalSection(&g_play_chat_lock)
+#else
+static pthread_mutex_t g_play_chat_lock = PTHREAD_MUTEX_INITIALIZER;
+static void init_play_chat_lock(void) {}
+static void destroy_play_chat_lock(void) {}
+#define PLAY_CHAT_LOCK() pthread_mutex_lock(&g_play_chat_lock)
+#define PLAY_CHAT_UNLOCK() pthread_mutex_unlock(&g_play_chat_lock)
+#endif
 
 #ifdef _WIN32
 static volatile LONG g_connected_play_sessions = 0;
@@ -101,13 +142,312 @@ typedef struct {
     socket_handle_t socket_fd;
     socket_handle_t server_fd;
     server_config_t server_config;
+    char username[32];
     int32_t client_protocol_version;
     client_stream_state_t stream_state;
     entity_registry_t entity_registry;
     entity_manager_t entity_manager;
     int32_t mock_entity_a;
     int32_t mock_entity_b;
+    int32_t spawned_entity_ids[256];
+    int32_t spawned_entity_types[256];
+    size_t spawned_entity_count;
 } client_session_t;
+
+static int track_spawned_entity_id(client_session_t *session, int32_t entity_id, int32_t entity_type) {
+    size_t i;
+
+    if (session == NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < session->spawned_entity_count; ++i) {
+        if (session->spawned_entity_ids[i] == entity_id) {
+            return 1;
+        }
+    }
+
+    if (session->spawned_entity_count >= (sizeof(session->spawned_entity_ids) / sizeof(session->spawned_entity_ids[0]))) {
+        return 0;
+    }
+
+    session->spawned_entity_ids[session->spawned_entity_count] = entity_id;
+    session->spawned_entity_types[session->spawned_entity_count] = entity_type;
+    session->spawned_entity_count += 1;
+    return 1;
+}
+
+static int untrack_spawned_entity_id(client_session_t *session, int32_t entity_id) {
+    size_t i;
+
+    if (session == NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < session->spawned_entity_count; ++i) {
+        if (session->spawned_entity_ids[i] == entity_id) {
+            size_t tail = session->spawned_entity_count - i - 1;
+            if (tail > 0) {
+                memmove(&session->spawned_entity_ids[i],
+                        &session->spawned_entity_ids[i + 1],
+                        tail * sizeof(session->spawned_entity_ids[0]));
+                memmove(&session->spawned_entity_types[i],
+                    &session->spawned_entity_types[i + 1],
+                    tail * sizeof(session->spawned_entity_types[0]));
+            }
+            session->spawned_entity_count -= 1;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int is_tracked_spawned_entity_id(const client_session_t *session, int32_t entity_id) {
+    size_t i;
+
+    if (session == NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < session->spawned_entity_count; ++i) {
+        if (session->spawned_entity_ids[i] == entity_id) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int username_equals_ci(const char *a, const char *b) {
+    size_t i = 0;
+
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+
+    while (a[i] != '\0' && b[i] != '\0') {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) {
+            return 0;
+        }
+        ++i;
+    }
+
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+static int is_username_muted(const char *username) {
+    size_t i;
+    int muted = 0;
+
+    if (username == NULL || username[0] == '\0') {
+        return 0;
+    }
+
+    PLAY_CHAT_LOCK();
+    for (i = 0; i < g_muted_username_count; ++i) {
+        if (username_equals_ci(g_muted_usernames[i], username)) {
+            muted = 1;
+            break;
+        }
+    }
+    PLAY_CHAT_UNLOCK();
+
+    return muted;
+}
+
+static int add_muted_username(const char *username) {
+    size_t i;
+
+    if (username == NULL || username[0] == '\0') {
+        return 0;
+    }
+
+    PLAY_CHAT_LOCK();
+    for (i = 0; i < g_muted_username_count; ++i) {
+        if (username_equals_ci(g_muted_usernames[i], username)) {
+            PLAY_CHAT_UNLOCK();
+            return 0;
+        }
+    }
+
+    if (g_muted_username_count >= MAX_MUTED_PLAYERS) {
+        PLAY_CHAT_UNLOCK();
+        return 0;
+    }
+
+    snprintf(g_muted_usernames[g_muted_username_count],
+             sizeof(g_muted_usernames[g_muted_username_count]),
+             "%s",
+             username);
+    g_muted_username_count += 1;
+    PLAY_CHAT_UNLOCK();
+    return 1;
+}
+
+static int remove_muted_username(const char *username) {
+    size_t i;
+
+    if (username == NULL || username[0] == '\0') {
+        return 0;
+    }
+
+    PLAY_CHAT_LOCK();
+    for (i = 0; i < g_muted_username_count; ++i) {
+        if (username_equals_ci(g_muted_usernames[i], username)) {
+            size_t tail = g_muted_username_count - i - 1;
+            if (tail > 0) {
+                memmove(&g_muted_usernames[i],
+                        &g_muted_usernames[i + 1],
+                        tail * sizeof(g_muted_usernames[0]));
+            }
+            g_muted_username_count -= 1;
+            PLAY_CHAT_UNLOCK();
+            return 1;
+        }
+    }
+    PLAY_CHAT_UNLOCK();
+
+    return 0;
+}
+
+static int is_username_moderator(const char *username) {
+    size_t i;
+    int is_mod = 0;
+
+    if (username == NULL || username[0] == '\0') {
+        return 0;
+    }
+
+    PLAY_CHAT_LOCK();
+    for (i = 0; i < g_moderator_username_count; ++i) {
+        if (username_equals_ci(g_moderator_usernames[i], username)) {
+            is_mod = 1;
+            break;
+        }
+    }
+    PLAY_CHAT_UNLOCK();
+
+    return is_mod;
+}
+
+static int add_moderator_username(const char *username) {
+    size_t i;
+
+    if (username == NULL || username[0] == '\0') {
+        return 0;
+    }
+
+    PLAY_CHAT_LOCK();
+    for (i = 0; i < g_moderator_username_count; ++i) {
+        if (username_equals_ci(g_moderator_usernames[i], username)) {
+            PLAY_CHAT_UNLOCK();
+            return 0;
+        }
+    }
+
+    if (g_moderator_username_count >= MAX_MODERATORS) {
+        PLAY_CHAT_UNLOCK();
+        return 0;
+    }
+
+    snprintf(g_moderator_usernames[g_moderator_username_count],
+             sizeof(g_moderator_usernames[g_moderator_username_count]),
+             "%s",
+             username);
+    g_moderator_username_count += 1;
+    PLAY_CHAT_UNLOCK();
+    return 1;
+}
+
+/* return 1 on removed, 0 if not found, -1 if operation would remove last moderator */
+static int remove_moderator_username(const char *username) {
+    size_t i;
+
+    if (username == NULL || username[0] == '\0') {
+        return 0;
+    }
+
+    PLAY_CHAT_LOCK();
+    for (i = 0; i < g_moderator_username_count; ++i) {
+        if (username_equals_ci(g_moderator_usernames[i], username)) {
+            size_t tail;
+            if (g_moderator_username_count <= 1) {
+                PLAY_CHAT_UNLOCK();
+                return -1;
+            }
+            tail = g_moderator_username_count - i - 1;
+            if (tail > 0) {
+                memmove(&g_moderator_usernames[i],
+                        &g_moderator_usernames[i + 1],
+                        tail * sizeof(g_moderator_usernames[0]));
+            }
+            g_moderator_username_count -= 1;
+            PLAY_CHAT_UNLOCK();
+            return 1;
+        }
+    }
+    PLAY_CHAT_UNLOCK();
+
+    return 0;
+}
+
+static int ensure_initial_moderator(const char *username) {
+    int promoted = 0;
+
+    if (username == NULL || username[0] == '\0') {
+        return 0;
+    }
+
+    PLAY_CHAT_LOCK();
+    if (g_moderator_username_count == 0 && g_moderator_username_count < MAX_MODERATORS) {
+        snprintf(g_moderator_usernames[g_moderator_username_count],
+                 sizeof(g_moderator_usernames[g_moderator_username_count]),
+                 "%s",
+                 username);
+        g_moderator_username_count += 1;
+        promoted = 1;
+    }
+    PLAY_CHAT_UNLOCK();
+
+    return promoted;
+}
+
+static void register_play_chat_socket(socket_handle_t socket_fd) {
+    size_t i;
+
+    PLAY_CHAT_LOCK();
+    for (i = 0; i < g_play_chat_socket_count; ++i) {
+        if (g_play_chat_sockets[i] == socket_fd) {
+            PLAY_CHAT_UNLOCK();
+            return;
+        }
+    }
+
+    if (g_play_chat_socket_count < MAX_PLAY_CHAT_SOCKETS) {
+        g_play_chat_sockets[g_play_chat_socket_count++] = socket_fd;
+    }
+    PLAY_CHAT_UNLOCK();
+}
+
+static void unregister_play_chat_socket(socket_handle_t socket_fd) {
+    size_t i;
+
+    PLAY_CHAT_LOCK();
+    for (i = 0; i < g_play_chat_socket_count; ++i) {
+        if (g_play_chat_sockets[i] == socket_fd) {
+            size_t tail = g_play_chat_socket_count - i - 1;
+            if (tail > 0) {
+                memmove(&g_play_chat_sockets[i],
+                        &g_play_chat_sockets[i + 1],
+                        tail * sizeof(g_play_chat_sockets[0]));
+            }
+            g_play_chat_socket_count -= 1;
+            break;
+        }
+    }
+    PLAY_CHAT_UNLOCK();
+}
 
 static void send_large_post_compression_packet(socket_handle_t socket_fd,
                                                const uint8_t *packet,
@@ -246,6 +586,378 @@ static int try_extract_position_from_play_packet(int32_t packet_id,
     *out_x = read_be_double_ptr(payload);
     *out_z = read_be_double_ptr(payload + 16);
     return 1;
+}
+
+static int read_prefixed_string_copy(const uint8_t **payload,
+                                     size_t *payload_len,
+                                     char *out,
+                                     size_t out_size) {
+    int32_t str_len;
+    size_t copy_len;
+
+    if (payload == NULL || *payload == NULL || payload_len == NULL || out == NULL || out_size == 0) {
+        return 0;
+    }
+
+    str_len = read_varint(payload, payload_len);
+    if (str_len < 0 || (size_t)str_len > *payload_len) {
+        return 0;
+    }
+
+    copy_len = (size_t)str_len;
+    if (copy_len >= out_size) {
+        copy_len = out_size - 1;
+    }
+
+    memcpy(out, *payload, copy_len);
+    out[copy_len] = '\0';
+
+    *payload += (size_t)str_len;
+    *payload_len -= (size_t)str_len;
+    return 1;
+}
+
+static int try_parse_spawn_request_ex(const char *text,
+                                      char *out_entity_name,
+                                      size_t out_entity_name_size,
+                                      int *out_count,
+                                      double *out_radius,
+                                      double *out_y_offset,
+                                      int *out_glow) {
+    const char *p = text;
+    const char *start;
+    const char *end;
+    size_t len;
+    int count = 1;
+    double radius = 2.0;
+    double y_offset = 0.0;
+    int glow = 0;
+
+    if (text == NULL || out_entity_name == NULL || out_entity_name_size == 0 || out_count == NULL ||
+        out_radius == NULL || out_y_offset == NULL || out_glow == NULL) {
+        return 0;
+    }
+
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (*p == '/') {
+        ++p;
+    }
+
+    if (strncmp(p, "spawn", 5) == 0) {
+        p += 5;
+    } else if (strncmp(p, "summon", 6) == 0) {
+        p += 6;
+    } else {
+        return 0;
+    }
+
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (*p == '\0') {
+        return 0;
+    }
+
+    start = p;
+    while (*p != '\0' && *p != ' ' && *p != '\t') {
+        ++p;
+    }
+    end = p;
+
+    len = (size_t)(end - start);
+    if (len == 0) {
+        return 0;
+    }
+    if (len >= out_entity_name_size) {
+        len = out_entity_name_size - 1;
+    }
+    memcpy(out_entity_name, start, len);
+    out_entity_name[len] = '\0';
+
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (*p != '\0') {
+        char *parse_end = NULL;
+        long parsed = strtol(p, &parse_end, 10);
+        if (parse_end != p && parsed > 0 && parsed <= 32) {
+            count = (int)parsed;
+            p = parse_end;
+            while (*p == ' ' || *p == '\t') {
+                ++p;
+            }
+        }
+    }
+
+    if (*p != '\0') {
+        char *parse_end = NULL;
+        double parsed = strtod(p, &parse_end);
+        if (parse_end != p && parsed >= 0.0 && parsed <= 32.0) {
+            radius = parsed;
+            p = parse_end;
+            while (*p == ' ' || *p == '\t') {
+                ++p;
+            }
+        }
+    }
+
+    if (*p != '\0') {
+        char *parse_end = NULL;
+        double parsed = strtod(p, &parse_end);
+        if (parse_end != p && parsed >= -32.0 && parsed <= 32.0) {
+            y_offset = parsed;
+            p = parse_end;
+            while (*p == ' ' || *p == '\t') {
+                ++p;
+            }
+        }
+    }
+
+    if (*p != '\0') {
+        if (strcmp(p, "glow") == 0) {
+            glow = 1;
+        } else if (strcmp(p, "noglow") == 0) {
+            glow = 0;
+        }
+    }
+
+    *out_count = count;
+    *out_radius = radius;
+    *out_y_offset = y_offset;
+    *out_glow = glow;
+    return 1;
+}
+
+static int command_equals(const char *text, const char *cmd) {
+    const char *p;
+    size_t cmd_len;
+
+    if (text == NULL || cmd == NULL) {
+        return 0;
+    }
+
+    p = text;
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (*p == '/') {
+        ++p;
+    }
+
+    cmd_len = strlen(cmd);
+    if (strncmp(p, cmd, cmd_len) != 0) {
+        return 0;
+    }
+
+    return p[cmd_len] == '\0' || p[cmd_len] == ' ' || p[cmd_len] == '\t';
+}
+
+static int command_extract_single_arg(const char *text,
+                                      const char *cmd,
+                                      char *out_arg,
+                                      size_t out_arg_size) {
+    const char *p;
+    const char *start;
+    size_t cmd_len;
+    size_t len;
+
+    if (text == NULL || cmd == NULL || out_arg == NULL || out_arg_size == 0) {
+        return 0;
+    }
+
+    p = text;
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (*p == '/') {
+        ++p;
+    }
+
+    cmd_len = strlen(cmd);
+    if (strncmp(p, cmd, cmd_len) != 0) {
+        return 0;
+    }
+
+    p += cmd_len;
+    if (*p != ' ' && *p != '\t') {
+        return 0;
+    }
+
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (*p == '\0') {
+        return 0;
+    }
+
+    start = p;
+    while (*p != '\0' && *p != ' ' && *p != '\t') {
+        ++p;
+    }
+
+    len = (size_t)(p - start);
+    if (len == 0) {
+        return 0;
+    }
+
+    if (len >= out_arg_size) {
+        len = out_arg_size - 1;
+    }
+
+    memcpy(out_arg, start, len);
+    out_arg[len] = '\0';
+    return 1;
+}
+
+static int find_entity_position(const entity_registry_t *registry,
+                                int32_t entity_id,
+                                double *out_x,
+                                double *out_y,
+                                double *out_z) {
+    int i;
+
+    if (registry == NULL || out_x == NULL || out_y == NULL || out_z == NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < 512; ++i) {
+        const entity_state_t *e = &registry->entries[i];
+        if (e->active && e->entity_id == entity_id) {
+            *out_x = e->x;
+            *out_y = e->y;
+            *out_z = e->z;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int try_parse_despawn_request(const char *text,
+                                     int *out_all,
+                                     int32_t *out_entity_id) {
+    const char *p = text;
+
+    if (text == NULL || out_all == NULL || out_entity_id == NULL) {
+        return 0;
+    }
+
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (*p == '/') {
+        ++p;
+    }
+
+    if (strncmp(p, "despawnall", 10) == 0 &&
+        (p[10] == '\0' || p[10] == ' ' || p[10] == '\t')) {
+        *out_all = 1;
+        *out_entity_id = 0;
+        return 1;
+    }
+
+    if (strncmp(p, "despawn", 7) != 0 ||
+        (p[7] != '\0' && p[7] != ' ' && p[7] != '\t')) {
+        return 0;
+    }
+
+    p += 7;
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+
+    if (*p == '\0') {
+        return 0;
+    }
+
+    {
+        char *parse_end = NULL;
+        long parsed = strtol(p, &parse_end, 10);
+        if (parse_end == p || parsed <= 0 || parsed > 2147483647L) {
+            return 0;
+        }
+        *out_all = 0;
+        *out_entity_id = (int32_t)parsed;
+        return 1;
+    }
+}
+
+static int lookup_entity_type_774(const char *entity_name, int32_t *out_entity_type) {
+    struct entity_type_map_entry {
+        const char *name;
+        int32_t type_id;
+    };
+    static const struct entity_type_map_entry map[] = {
+        {"armor_stand", 5},
+        {"chicken", 26},
+        {"cow", 30},
+        {"sheep", 111},
+        {"pig", 100},
+        {"rabbit", 108},
+        {"wolf", 148},
+        {"cat", 21},
+        {"horse", 66},
+        {"villager", 139},
+        {"zombie", 150},
+        {"skeleton", 115},
+        {"creeper", 32},
+        {"spider", 124},
+        {"enderman", 41}
+    };
+    char normalized[64];
+    size_t i;
+    size_t n;
+
+    if (entity_name == NULL || out_entity_type == NULL) {
+        return 0;
+    }
+
+    n = strlen(entity_name);
+    if (n == 0 || n >= sizeof(normalized)) {
+        return 0;
+    }
+
+    for (i = 0; i < n; ++i) {
+        unsigned char ch = (unsigned char)entity_name[i];
+        if (ch == '-') {
+            normalized[i] = '_';
+        } else {
+            normalized[i] = (char)tolower(ch);
+        }
+    }
+    normalized[n] = '\0';
+
+    for (i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
+        if (strcmp(normalized, map[i].name) == 0) {
+            *out_entity_type = map[i].type_id;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static const char *lookup_entity_name_by_type_774(int32_t entity_type) {
+    switch (entity_type) {
+        case 5: return "armor_stand";
+        case 21: return "cat";
+        case 26: return "chicken";
+        case 30: return "cow";
+        case 32: return "creeper";
+        case 41: return "enderman";
+        case 66: return "horse";
+        case 100: return "pig";
+        case 108: return "rabbit";
+        case 111: return "sheep";
+        case 115: return "skeleton";
+        case 124: return "spider";
+        case 139: return "villager";
+        case 148: return "wolf";
+        case 150: return "zombie";
+        default: return "unknown";
+    }
 }
 
 static int send_stream_chunk(client_session_t *session,
@@ -618,6 +1330,52 @@ static void send_play_disconnect(socket_handle_t socket_fd,
     send_post_compression_packet(socket_fd, packet, packet_len);
 }
 
+static void send_system_chat_message(socket_handle_t socket_fd,
+                                     const char *text,
+                                     int overlay) {
+    uint8_t packet[768];
+    size_t packet_len = 0;
+    size_t nbt_len;
+
+    if (text == NULL) {
+        return;
+    }
+
+    packet_len += write_varint(packet + packet_len, PLAY774_S2C_SYSTEM_CHAT);
+    nbt_len = write_network_nbt_string(packet + packet_len,
+                                       sizeof(packet) - packet_len,
+                                       text);
+    if (nbt_len == 0) {
+        return;
+    }
+    packet_len += nbt_len;
+    packet[packet_len++] = overlay ? 0x01 : 0x00;
+
+    send_post_compression_packet(socket_fd, packet, packet_len);
+}
+
+static void broadcast_system_chat_message(const char *text, int overlay) {
+    socket_handle_t sockets[MAX_PLAY_CHAT_SOCKETS];
+    size_t count = 0;
+    size_t i;
+
+    if (text == NULL) {
+        return;
+    }
+
+    PLAY_CHAT_LOCK();
+    count = g_play_chat_socket_count;
+    if (count > MAX_PLAY_CHAT_SOCKETS) {
+        count = MAX_PLAY_CHAT_SOCKETS;
+    }
+    memcpy(sockets, g_play_chat_sockets, count * sizeof(sockets[0]));
+    PLAY_CHAT_UNLOCK();
+
+    for (i = 0; i < count; ++i) {
+        send_system_chat_message(sockets[i], text, overlay);
+    }
+}
+
 static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_t *packet, size_t packet_len) {
     uint8_t framed[8192];
     size_t framed_len = double_frame_packet(framed, packet, packet_len);
@@ -789,6 +1547,23 @@ static void run_play_state_loop(client_session_t *session,
         uint64_t play_packets_parsed = 0;
         uint64_t play_packets_parse_failed = 0;
         increment_connected_play_sessions();
+        register_play_chat_socket(socket_fd);
+        if (ensure_initial_moderator(session->username)) {
+            char mod_msg[128];
+            snprintf(mod_msg,
+                     sizeof(mod_msg),
+                     "[MOD] %s is now a moderator (first player).",
+                     session->username[0] ? session->username : "Player");
+            broadcast_system_chat_message(mod_msg, 0);
+        }
+        {
+            char join_msg[128];
+            snprintf(join_msg,
+                     sizeof(join_msg),
+                     "[JOIN] %s joined the game",
+                     session->username[0] ? session->username : "Player");
+            broadcast_system_chat_message(join_msg, 0);
+        }
         time_t last_keepalive = time(NULL);
         time_t last_client_activity = time(NULL);
         time_t last_entity_event_log = time(NULL);
@@ -1036,6 +1811,414 @@ static void run_play_state_loop(client_session_t *session,
                         printf("Play packet ID from client: %d\n", play_pid);
                     }
 
+                    if (session->server_config.enable_experimental_entities &&
+                        session->server_config.enable_experimental_entity_packets &&
+                        session->client_protocol_version == 774) {
+                        char command_text[256];
+                        int have_command_text = 0;
+                        const uint8_t *cmd_payload = play_payload;
+                        size_t cmd_payload_len = play_payload_len;
+
+                            /* Protocol 774 serverbound command/message packets.
+                            * 0x06: chat_command
+                            * 0x07: chat_command_signed
+                            * 0x08: chat message */
+                            if ((play_pid == PLAY774_C2S_CHAT_COMMAND ||
+                                play_pid == PLAY774_C2S_CHAT_COMMAND_SIGNED ||
+                                play_pid == PLAY774_C2S_CHAT_MESSAGE) &&
+                            read_prefixed_string_copy(&cmd_payload,
+                                                      &cmd_payload_len,
+                                                      command_text,
+                                                      sizeof(command_text))) {
+                            have_command_text = 1;
+                        }
+
+                        if (have_command_text) {
+                            char entity_name[64];
+                            int spawn_count = 1;
+                            int32_t entity_type = 0;
+                            int handled = 0;
+                            int sender_is_mod = is_username_moderator(session->username);
+
+                            if (command_equals(command_text, "help")) {
+                                send_system_chat_message(socket_fd, "Commands: /spawn <type> [count] [radius] [y_offset] [glow|noglow]", 0);
+                                send_system_chat_message(socket_fd, "Commands: /despawn <entity_id>, /despawnall, /listentities", 0);
+                                send_system_chat_message(socket_fd, "Commands: /mute <player>, /unmute <player>, /mutelist", 0);
+                                send_system_chat_message(socket_fd, "Commands: /op <player>, /deop <player>, /modlist", 0);
+                                send_system_chat_message(socket_fd, "Examples: /spawn cow 5 4 0 glow ; /despawnall", 0);
+                                handled = 1;
+                            } else if (command_equals(command_text, "listentities")) {
+                                if (session->spawned_entity_count == 0) {
+                                    send_system_chat_message(socket_fd, "No tracked spawned entities.", 0);
+                                } else {
+                                    char feedback[192];
+                                    size_t i;
+                                    snprintf(feedback, sizeof(feedback), "Tracked entities: %zu", session->spawned_entity_count);
+                                    send_system_chat_message(socket_fd, feedback, 0);
+                                    for (i = 0; i < session->spawned_entity_count && i < 20; ++i) {
+                                        int32_t id = session->spawned_entity_ids[i];
+                                        int32_t typ = session->spawned_entity_types[i];
+                                        double ex = 0.0, ey = 0.0, ez = 0.0;
+                                        const char *name = lookup_entity_name_by_type_774(typ);
+                                        if (find_entity_position(&session->entity_registry, id, &ex, &ey, &ez)) {
+                                            snprintf(feedback, sizeof(feedback), "#%d %s(type=%d) at %.1f %.1f %.1f", (int)id, name, (int)typ, ex, ey, ez);
+                                        } else {
+                                            snprintf(feedback, sizeof(feedback), "#%d %s(type=%d) position unavailable", (int)id, name, (int)typ);
+                                        }
+                                        send_system_chat_message(socket_fd, feedback, 0);
+                                    }
+                                    if (session->spawned_entity_count > 20) {
+                                        send_system_chat_message(socket_fd, "Showing first 20 tracked entities.", 0);
+                                    }
+                                }
+                                handled = 1;
+                            } else {
+                                char target_name[32];
+                                if (command_extract_single_arg(command_text, "mute", target_name, sizeof(target_name))) {
+                                    char feedback[160];
+                                    if (!sender_is_mod) {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] You do not have permission to use /mute.");
+                                    } else if (add_muted_username(target_name)) {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] Muted %s.",
+                                                 target_name);
+                                    } else {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] %s is already muted or mute list is full.",
+                                                 target_name);
+                                    }
+                                    send_system_chat_message(socket_fd, feedback, 0);
+                                    handled = 1;
+                                } else if (command_extract_single_arg(command_text, "unmute", target_name, sizeof(target_name))) {
+                                    char feedback[160];
+                                    if (!sender_is_mod) {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] You do not have permission to use /unmute.");
+                                    } else if (remove_muted_username(target_name)) {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] Unmuted %s.",
+                                                 target_name);
+                                    } else {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] %s was not muted.",
+                                                 target_name);
+                                    }
+                                    send_system_chat_message(socket_fd, feedback, 0);
+                                    handled = 1;
+                                } else if (command_equals(command_text, "mutelist")) {
+                                    char muted_snapshot[20][32];
+                                    size_t muted_count = 0;
+                                    size_t i;
+                                    PLAY_CHAT_LOCK();
+                                    muted_count = g_muted_username_count;
+                                    if (muted_count > 20) {
+                                        muted_count = 20;
+                                    }
+                                    for (i = 0; i < muted_count; ++i) {
+                                        snprintf(muted_snapshot[i], sizeof(muted_snapshot[i]), "%s", g_muted_usernames[i]);
+                                    }
+                                    PLAY_CHAT_UNLOCK();
+
+                                    if (muted_count == 0) {
+                                        send_system_chat_message(socket_fd, "[MOD] No muted players.", 0);
+                                    } else {
+                                        char feedback[192];
+                                        send_system_chat_message(socket_fd, "[MOD] Muted players:", 0);
+                                        for (i = 0; i < muted_count; ++i) {
+                                            snprintf(feedback,
+                                                     sizeof(feedback),
+                                                     "- %s",
+                                                     muted_snapshot[i]);
+                                            send_system_chat_message(socket_fd, feedback, 0);
+                                        }
+                                        if (muted_count == 20) {
+                                            send_system_chat_message(socket_fd, "[MOD] Showing first 20 muted players.", 0);
+                                        }
+                                    }
+                                    handled = 1;
+                                } else if (command_extract_single_arg(command_text, "op", target_name, sizeof(target_name))) {
+                                    char feedback[160];
+                                    if (!sender_is_mod) {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] You do not have permission to use /op.");
+                                    } else if (add_moderator_username(target_name)) {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] %s is now a moderator.",
+                                                 target_name);
+                                        broadcast_system_chat_message(feedback, 0);
+                                    } else {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] %s is already a moderator or moderator list is full.",
+                                                 target_name);
+                                    }
+                                    send_system_chat_message(socket_fd, feedback, 0);
+                                    handled = 1;
+                                } else if (command_extract_single_arg(command_text, "deop", target_name, sizeof(target_name))) {
+                                    char feedback[160];
+                                    int rc;
+                                    if (!sender_is_mod) {
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "[MOD] You do not have permission to use /deop.");
+                                    } else {
+                                        rc = remove_moderator_username(target_name);
+                                        if (rc == 1) {
+                                            snprintf(feedback,
+                                                     sizeof(feedback),
+                                                     "[MOD] %s is no longer a moderator.",
+                                                     target_name);
+                                            broadcast_system_chat_message(feedback, 0);
+                                        } else if (rc == -1) {
+                                            snprintf(feedback,
+                                                     sizeof(feedback),
+                                                     "[MOD] Cannot remove the last moderator.");
+                                        } else {
+                                            snprintf(feedback,
+                                                     sizeof(feedback),
+                                                     "[MOD] %s is not a moderator.",
+                                                     target_name);
+                                        }
+                                    }
+                                    send_system_chat_message(socket_fd, feedback, 0);
+                                    handled = 1;
+                                } else if (command_equals(command_text, "modlist")) {
+                                    char moderator_snapshot[20][32];
+                                    size_t moderator_count = 0;
+                                    size_t i;
+                                    PLAY_CHAT_LOCK();
+                                    moderator_count = g_moderator_username_count;
+                                    if (moderator_count > 20) {
+                                        moderator_count = 20;
+                                    }
+                                    for (i = 0; i < moderator_count; ++i) {
+                                        snprintf(moderator_snapshot[i], sizeof(moderator_snapshot[i]), "%s", g_moderator_usernames[i]);
+                                    }
+                                    PLAY_CHAT_UNLOCK();
+
+                                    if (moderator_count == 0) {
+                                        send_system_chat_message(socket_fd, "[MOD] No moderators configured.", 0);
+                                    } else {
+                                        char feedback[192];
+                                        send_system_chat_message(socket_fd, "[MOD] Moderators:", 0);
+                                        for (i = 0; i < moderator_count; ++i) {
+                                            snprintf(feedback,
+                                                     sizeof(feedback),
+                                                     "- %s",
+                                                     moderator_snapshot[i]);
+                                            send_system_chat_message(socket_fd, feedback, 0);
+                                        }
+                                        if (moderator_count == 20) {
+                                            send_system_chat_message(socket_fd, "[MOD] Showing first 20 moderators.", 0);
+                                        }
+                                    }
+                                    handled = 1;
+                                }
+                            }
+
+                            if (!handled) {
+                                double spawn_radius = 2.0;
+                                double spawn_y_offset = 0.0;
+                                int spawn_glow = 0;
+
+                                if (try_parse_spawn_request_ex(command_text,
+                                                               entity_name,
+                                                               sizeof(entity_name),
+                                                               &spawn_count,
+                                                               &spawn_radius,
+                                                               &spawn_y_offset,
+                                                               &spawn_glow)) {
+                                    if (lookup_entity_type_774(entity_name, &entity_type)) {
+                                        double spawn_base_x = has_last_activity_position ? last_activity_x : 0.5;
+                                        double spawn_base_z = has_last_activity_position ? last_activity_z : 0.5;
+                                        double spawn_base_y = 64.0;
+                                        int spawned_ok = 0;
+                                        int i;
+
+                                        for (i = 0; i < 512; ++i) {
+                                            entity_state_t *e = &session->entity_registry.entries[i];
+                                            if (e->active && e->entity_id == 1) {
+                                                spawn_base_y = e->y;
+                                                break;
+                                            }
+                                        }
+
+                                        for (i = 0; i < spawn_count; ++i) {
+                                            int32_t new_entity_id = 0;
+                                            double angle = ((double)i / (double)spawn_count) * 6.28318530718;
+                                            double sx = spawn_base_x + cos(angle) * spawn_radius;
+                                            double sy = spawn_base_y + spawn_y_offset;
+                                            double sz = spawn_base_z + sin(angle) * spawn_radius;
+                                            uint8_t se_buf[128];
+                                            size_t se_len;
+
+                                            if (!entity_manager_queue_spawn_auto(&session->entity_registry,
+                                                                                 &session->entity_manager,
+                                                                                 ENTITY_KIND_MOB,
+                                                                                 sx,
+                                                                                 sy,
+                                                                                 sz,
+                                                                                 &new_entity_id)) {
+                                                continue;
+                                            }
+
+                                            se_len = build_spawn_entity_packet(se_buf,
+                                                                               sizeof(se_buf),
+                                                                               new_entity_id,
+                                                                               entity_type,
+                                                                               sx,
+                                                                               sy,
+                                                                               sz,
+                                                                               0,
+                                                                               0,
+                                                                               0,
+                                                                               0);
+                                            send_post_compression_packet(socket_fd, se_buf, se_len);
+                                            if (spawn_glow) {
+                                                uint8_t md_buf[32];
+                                                size_t md_len = build_set_entity_glowing_packet(md_buf, sizeof(md_buf), new_entity_id, 1);
+                                                send_post_compression_packet(socket_fd, md_buf, md_len);
+                                            }
+                                            track_spawned_entity_id(session, new_entity_id, entity_type);
+                                            spawned_ok += 1;
+                                        }
+
+                                        printf("Spawn command '%s': spawned %d entity(s) of type %s (%d).\n",
+                                               command_text,
+                                               spawned_ok,
+                                               entity_name,
+                                               entity_type);
+                                        {
+                                            char feedback[256];
+                                            snprintf(feedback,
+                                                     sizeof(feedback),
+                                                     "Spawned %d %s (r=%.1f yoff=%.1f glow=%s).",
+                                                     spawned_ok,
+                                                     entity_name,
+                                                     spawn_radius,
+                                                     spawn_y_offset,
+                                                     spawn_glow ? "yes" : "no");
+                                            send_system_chat_message(socket_fd, feedback, 0);
+                                        }
+                                    } else {
+                                        printf("Spawn command '%s' ignored: unknown entity '%s'.\n",
+                                               command_text,
+                                               entity_name);
+                                        {
+                                            char feedback[256];
+                                            snprintf(feedback,
+                                                     sizeof(feedback),
+                                                     "Unknown entity '%s'. Try: cow pig sheep zombie skeleton creeper spider enderman villager horse cat wolf rabbit chicken.",
+                                                     entity_name);
+                                            send_system_chat_message(socket_fd, feedback, 0);
+                                        }
+                                    }
+                                } else {
+                                    int remove_all = 0;
+                                    int32_t remove_id = 0;
+                                    if (try_parse_despawn_request(command_text, &remove_all, &remove_id)) {
+                                        if (remove_all) {
+                                            int32_t remove_ids[256];
+                                            size_t remove_count = 0;
+                                            size_t i;
+
+                                            for (i = 0; i < session->spawned_entity_count; ++i) {
+                                                int32_t id = session->spawned_entity_ids[i];
+                                                if (entity_manager_queue_remove(&session->entity_registry,
+                                                                                &session->entity_manager,
+                                                                                id)) {
+                                                    remove_ids[remove_count++] = id;
+                                                }
+                                            }
+
+                                            session->spawned_entity_count = 0;
+
+                                            if (remove_count > 0) {
+                                                uint8_t rem_buf[2048];
+                                                size_t rem_len = build_entity_destroy_packet(rem_buf,
+                                                                                             sizeof(rem_buf),
+                                                                                             remove_ids,
+                                                                                             remove_count);
+                                                send_post_compression_packet(socket_fd, rem_buf, rem_len);
+                                            }
+
+                                            {
+                                                char feedback[128];
+                                                snprintf(feedback,
+                                                         sizeof(feedback),
+                                                         "Despawned %zu tracked entity(s).",
+                                                         remove_count);
+                                                send_system_chat_message(socket_fd, feedback, 0);
+                                            }
+                                        } else {
+                                            int removed = 0;
+                                            if (is_tracked_spawned_entity_id(session, remove_id)) {
+                                                removed = entity_manager_queue_remove(&session->entity_registry,
+                                                                                      &session->entity_manager,
+                                                                                      remove_id);
+                                                if (removed) {
+                                                    uint8_t rem_buf[64];
+                                                    size_t rem_len = build_entity_destroy_packet(rem_buf,
+                                                                                                 sizeof(rem_buf),
+                                                                                                 &remove_id,
+                                                                                                 1);
+                                                    send_post_compression_packet(socket_fd, rem_buf, rem_len);
+                                                    (void)untrack_spawned_entity_id(session, remove_id);
+                                                }
+                                            }
+
+                                            if (removed) {
+                                                char feedback[128];
+                                                snprintf(feedback,
+                                                         sizeof(feedback),
+                                                         "Despawned entity %d.",
+                                                         (int)remove_id);
+                                                send_system_chat_message(socket_fd, feedback, 0);
+                                            } else {
+                                                char feedback[160];
+                                                snprintf(feedback,
+                                                         sizeof(feedback),
+                                                         "Entity %d not found in tracked spawned entities.",
+                                                         (int)remove_id);
+                                                send_system_chat_message(socket_fd, feedback, 0);
+                                            }
+                                        }
+                                    } else if (play_pid == PLAY774_C2S_CHAT_MESSAGE) {
+                                        const char *sender_name = session->username[0] ? session->username : "Player";
+                                        if (is_username_muted(sender_name)) {
+                                            send_system_chat_message(socket_fd, "[MOD] You are muted.", 0);
+                                        } else {
+                                            char feedback[320];
+                                            snprintf(feedback,
+                                                     sizeof(feedback),
+                                                     "[CHAT] <%s> %s",
+                                                     sender_name,
+                                                     command_text);
+                                            broadcast_system_chat_message(feedback, 0);
+                                        }
+                                    } else if (play_pid == PLAY774_C2S_CHAT_COMMAND ||
+                                               play_pid == PLAY774_C2S_CHAT_COMMAND_SIGNED) {
+                                        char feedback[224];
+                                        snprintf(feedback,
+                                                 sizeof(feedback),
+                                                 "Unknown command: /%s (try /help)",
+                                                 command_text);
+                                        send_system_chat_message(socket_fd, feedback, 0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     {
                         if (has_position) {
                             int32_t moved_chunk_x = (int32_t)floor(player_x / 16.0);
@@ -1143,6 +2326,13 @@ static void run_play_state_loop(client_session_t *session,
         entity_manager_clear(&session->entity_manager);
 
         if (entered_play_state) {
+            char leave_msg[128];
+            snprintf(leave_msg,
+                     sizeof(leave_msg),
+                     "[LEAVE] %s left the game",
+                     session->username[0] ? session->username : "Player");
+            broadcast_system_chat_message(leave_msg, 0);
+            unregister_play_chat_socket(socket_fd);
             decrement_connected_play_sessions();
         }
     }
@@ -1224,6 +2414,7 @@ static void handle_client_connection(client_session_t *session) {
                     return;
                 }
                 printf("Login Start: username=%s\n", username);
+                snprintf(session->username, sizeof(session->username), "%s", username);
 
                 if (server_config.reject_protocol_mismatch &&
                     session->client_protocol_version != server_config.protocol_number) {
@@ -2101,6 +3292,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 #endif
+    init_play_chat_lock();
 
     server_config_status = load_server_config_with_fallbacks(
         &server_config,
@@ -2109,6 +3301,7 @@ int main() {
         sizeof(server_config_error));
     if (server_config_status < 0) {
         fprintf(stderr, "Failed to load server config: %s\n", server_config_error);
+        destroy_play_chat_lock();
 #ifdef _WIN32
         WSACleanup();
 #endif
@@ -2225,6 +3418,7 @@ int main() {
             session->socket_fd = new_socket;
             session->server_fd = server_fd;
             session->server_config = server_config;
+            snprintf(session->username, sizeof(session->username), "Player");
             entity_registry_init(&session->entity_registry);
             entity_manager_init(&session->entity_manager);
 
@@ -2261,7 +3455,10 @@ int main() {
 
 #ifdef _WIN32
     closesocket(server_fd);
+    destroy_play_chat_lock();
     WSACleanup();
+#else
+    destroy_play_chat_lock();
 #endif
     return 0;
 }
