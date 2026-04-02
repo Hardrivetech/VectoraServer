@@ -48,6 +48,12 @@ int entity_manager_queue_update_xz(entity_registry_t *registry,
                                    int32_t entity_id,
                                    double x,
                                    double z);
+int entity_manager_queue_update_xyz(entity_registry_t *registry,
+                                    entity_manager_t *manager,
+                                    int32_t entity_id,
+                                    double x,
+                                    double y,
+                                    double z);
 int entity_manager_queue_remove(entity_registry_t *registry,
                                 entity_manager_t *manager,
                                 int32_t entity_id);

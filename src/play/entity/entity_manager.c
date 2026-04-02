@@ -87,7 +87,28 @@ int entity_manager_queue_update_xz(entity_registry_t *registry,
                                    int32_t entity_id,
                                    double x,
                                    double z) {
-    if (!entity_registry_update_xz(registry, entity_id, x, z)) {
+    int idx;
+    double y = 0.0;
+
+    if (registry != NULL) {
+        for (idx = 0; idx < (int)(sizeof(registry->entries) / sizeof(registry->entries[0])); ++idx) {
+            if (registry->entries[idx].active && registry->entries[idx].entity_id == entity_id) {
+                y = registry->entries[idx].y;
+                break;
+            }
+        }
+    }
+
+    return entity_manager_queue_update_xyz(registry, manager, entity_id, x, y, z);
+}
+
+int entity_manager_queue_update_xyz(entity_registry_t *registry,
+                                    entity_manager_t *manager,
+                                    int32_t entity_id,
+                                    double x,
+                                    double y,
+                                    double z) {
+    if (!entity_registry_update_xyz(registry, entity_id, x, y, z)) {
         return 0;
     }
 
@@ -95,12 +116,13 @@ int entity_manager_queue_update_xz(entity_registry_t *registry,
         entity_event_t *last = &manager->pending[manager->pending_count - 1];
         if (last->event_kind == ENTITY_EVENT_UPDATE && last->entity_id == entity_id) {
             last->x = x;
+            last->y = y;
             last->z = z;
             return 1;
         }
     }
 
-    return push_event(manager, ENTITY_EVENT_UPDATE, entity_id, ENTITY_KIND_UNKNOWN, x, 0.0, z);
+    return push_event(manager, ENTITY_EVENT_UPDATE, entity_id, ENTITY_KIND_UNKNOWN, x, y, z);
 }
 
 int entity_manager_queue_remove(entity_registry_t *registry,

@@ -82,7 +82,31 @@ int entity_registry_update_xz(entity_registry_t *registry,
         return 0;
     }
 
+    return entity_registry_update_xyz(registry,
+                                      entity_id,
+                                      x,
+                                      registry->entries[idx].y,
+                                      z);
+}
+
+int entity_registry_update_xyz(entity_registry_t *registry,
+                               int32_t entity_id,
+                               double x,
+                               double y,
+                               double z) {
+    int idx;
+
+    if (registry == NULL) {
+        return 0;
+    }
+
+    idx = find_index(registry, entity_id);
+    if (idx < 0) {
+        return 0;
+    }
+
     registry->entries[idx].x = x;
+    registry->entries[idx].y = y;
     registry->entries[idx].z = z;
     return 1;
 }

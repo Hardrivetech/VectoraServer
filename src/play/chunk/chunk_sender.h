@@ -25,4 +25,16 @@ uint8_t *build_chunk_data_packet(const uint8_t *nbt, size_t nbt_len,
 uint8_t *build_debug_flat_chunk_packet(int32_t chunk_x, int32_t chunk_z,
                                        size_t *out_len);
 
+/*
+ * Build a simple procedurally generated overworld chunk used when no real
+ * chunk data is available. Terrain is deterministic from chunk coordinates.
+ */
+uint8_t *build_generated_overworld_chunk_packet(int32_t chunk_x, int32_t chunk_z,
+                                                size_t *out_len);
+
+/*
+ * Compute the generated terrain surface Y for a block position.
+ */
+int32_t generated_world_surface_y(int32_t block_x, int32_t block_z);
+
 #endif /* CHUNK_SENDER_H */

@@ -273,6 +273,25 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     if (strcmp(key, "world_path") == 0) {
         return parse_string_value(value, config->world_path, sizeof(config->world_path));
     }
+    if (strcmp(key, "world_source") == 0) {
+        if (strcmp(value, "auto") == 0) {
+            config->world_source_mode = WORLD_SOURCE_MODE_AUTO;
+            return 1;
+        }
+        if (strcmp(value, "real") == 0) {
+            config->world_source_mode = WORLD_SOURCE_MODE_REAL;
+            return 1;
+        }
+        if (strcmp(value, "generated") == 0) {
+            config->world_source_mode = WORLD_SOURCE_MODE_GENERATED;
+            return 1;
+        }
+        if (strcmp(value, "debug") == 0) {
+            config->world_source_mode = WORLD_SOURCE_MODE_DEBUG;
+            return 1;
+        }
+        return 0;
+    }
 
     if (!parse_bool_value(value, &parsed)) {
         return 0;
@@ -431,6 +450,7 @@ void set_server_config_defaults(server_config_t *config) {
     config->pvp_enabled = 1;
     config->spawn_protection_radius = 16;
     get_default_game_rules(&config->game_rules);
+    config->world_source_mode = WORLD_SOURCE_MODE_AUTO;
     config->force_debug_spawn = 0;
     config->enable_real_chunks = 1;
     config->allow_debug_chunk_fallback = 1;

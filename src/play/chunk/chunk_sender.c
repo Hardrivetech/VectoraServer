@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* =========================================================================
  * Dynamic byte buffer
@@ -118,12 +119,18 @@ static const block_entry_t BLOCK_TABLE[] = {
     {"minecraft:polished_andesite",     7},
 
     /* --- dirt family --------------------------------------------------- */
-    {"minecraft:grass_block",           8},   /* snowy=false state */
+    {"minecraft:grass_block",           9},
     {"minecraft:dirt",                 10},
     {"minecraft:coarse_dirt",          11},
     {"minecraft:podzol",               12},   /* snowy=false state */
     {"minecraft:rooted_dirt",          14},
     {"minecraft:mud",                  15},
+
+    /* --- overworld terrain extras ------------------------------------- */
+    {"minecraft:water",                80},
+    {"minecraft:sand",                112},
+    {"minecraft:oak_log",             131},
+    {"minecraft:oak_leaves",          264},
 
     /* --- cobblestone / planks ------------------------------------------ */
     {"minecraft:cobblestone",          16},
@@ -499,6 +506,17 @@ static uint64_t read_u64_be_ptr(const uint8_t *p) {
            ((uint64_t)p[5] << 16) |
            ((uint64_t)p[6] <<  8) |
             (uint64_t)p[7];
+}
+
+static void write_u64_be_ptr(uint8_t *p, uint64_t v) {
+    p[0] = (uint8_t)(v >> 56);
+    p[1] = (uint8_t)(v >> 48);
+    p[2] = (uint8_t)(v >> 40);
+    p[3] = (uint8_t)(v >> 32);
+    p[4] = (uint8_t)(v >> 24);
+    p[5] = (uint8_t)(v >> 16);
+    p[6] = (uint8_t)(v >> 8);
+    p[7] = (uint8_t)(v & 0xFF);
 }
 
 /*
@@ -911,6 +929,330 @@ uint8_t *build_debug_flat_chunk_packet(int32_t chunk_x, int32_t chunk_z,
     if (!db_varint(&b, 0)) goto fail;
 
     /* Light */
+    if (!write_light_data(&b)) goto fail;
+
+    *out_len = b.len;
+    return b.data;
+
+fail:
+    free(b.data);
+    return NULL;
+}
+
+int32_t generated_world_surface_y(int32_t block_x, int32_t block_z) {
+    double height = 69.0;
+
+    height += sin((double)block_x * 0.045) * 9.0;
+    height += cos((double)block_z * 0.040) * 7.0;
+    height += sin((double)(block_x + block_z) * 0.018) * 5.0;
+    height += cos((double)(block_x - block_z) * 0.012) * 3.0;
+
+    if (height < 50.0) {
+        height = 50.0;
+    }
+    if (height > 108.0) {
+        height = 108.0;
+    }
+
+    return (int32_t)floor(height);
+}
+
+#define GENERATED_SEA_LEVEL 64
+
+static uint32_t generated_world_hash(int32_t block_x, int32_t block_z) {
+    uint32_t x = (uint32_t)block_x;
+    uint32_t z = (uint32_t)block_z;
+    uint32_t hash = x * 374761393u;
+
+    hash += z * 668265263u;
+    hash = (hash ^ (hash >> 13)) * 1274126177u;
+    return hash ^ (hash >> 16);
+}
+
+static int generated_world_chunk_local(int32_t value) {
+    int local = value % 16;
+
+    if (local < 0) {
+        local += 16;
+    }
+    return local;
+}
+
+static int generated_world_has_tree(int32_t block_x, int32_t block_z, int32_t surface_y) {
+    int32_t slope_x;
+    int32_t slope_z;
+    int local_x = generated_world_chunk_local(block_x);
+    int local_z = generated_world_chunk_local(block_z);
+
+    if (surface_y <= GENERATED_SEA_LEVEL + 1 || surface_y >= 96) {
+        return 0;
+    }
+    if (local_x < 2 || local_x > 13 || local_z < 2 || local_z > 13) {
+        return 0;
+    }
+
+    slope_x = abs(surface_y - generated_world_surface_y(block_x + 1, block_z));
+    slope_x += abs(surface_y - generated_world_surface_y(block_x - 1, block_z));
+    slope_z = abs(surface_y - generated_world_surface_y(block_x, block_z + 1));
+    slope_z += abs(surface_y - generated_world_surface_y(block_x, block_z - 1));
+    if (slope_x + slope_z > 3) {
+        return 0;
+    }
+
+    return (generated_world_hash(block_x, block_z) % 97u) == 0u;
+}
+
+static int generated_world_tree_height(int32_t block_x, int32_t block_z) {
+    return 4 + (int)((generated_world_hash(block_x, block_z) >> 8) % 3u);
+}
+
+static int32_t generated_world_tree_block(int32_t world_x,
+                                          int32_t world_y,
+                                          int32_t world_z,
+                                          int32_t oak_log_id,
+                                          int32_t oak_leaves_id) {
+    for (int dz = -2; dz <= 2; ++dz) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            int32_t trunk_x = world_x - dx;
+            int32_t trunk_z = world_z - dz;
+            int32_t trunk_surface_y = generated_world_surface_y(trunk_x, trunk_z);
+            int trunk_height;
+            int crown_base_y;
+            int leaf_radius;
+            int leaf_dx;
+            int leaf_dz;
+            int leaf_dy;
+
+            if (!generated_world_has_tree(trunk_x, trunk_z, trunk_surface_y)) {
+                continue;
+            }
+
+            trunk_height = generated_world_tree_height(trunk_x, trunk_z);
+            if (world_x == trunk_x && world_z == trunk_z &&
+                world_y > trunk_surface_y &&
+                world_y <= trunk_surface_y + trunk_height) {
+                return oak_log_id;
+            }
+
+            crown_base_y = trunk_surface_y + trunk_height - 2;
+            leaf_dy = (int)(world_y - crown_base_y);
+            if (leaf_dy < 0 || leaf_dy > 3) {
+                continue;
+            }
+
+            leaf_radius = (leaf_dy == 3) ? 1 : 2;
+            leaf_dx = abs(dx);
+            leaf_dz = abs(dz);
+            if (leaf_dx > leaf_radius || leaf_dz > leaf_radius) {
+                continue;
+            }
+            if (leaf_dy == 3 && leaf_dx + leaf_dz > 1) {
+                continue;
+            }
+            if (leaf_dy == 0 && leaf_dx == 2 && leaf_dz == 2) {
+                continue;
+            }
+            if (world_x == trunk_x && world_z == trunk_z &&
+                world_y <= trunk_surface_y + trunk_height) {
+                continue;
+            }
+
+            return oak_leaves_id;
+        }
+    }
+
+    return 0;
+}
+
+static int build_generated_section(section_bs_t *bs,
+                                   uint16_t *non_air_count,
+                                   uint8_t *packed_out,
+                                   int32_t chunk_x,
+                                   int32_t chunk_z,
+                                   int section_y) {
+    int32_t palette_ids[8];
+    uint8_t palette_indices[4096];
+    uint64_t longs[256];
+    int palette_size = 0;
+    int bits;
+    uint32_t long_count;
+    int y_base = (section_y + SECTION_Y_MIN) * 16;
+    uint16_t non_air = 0;
+    int32_t air_id = 0;
+    int32_t stone_id = 1;
+    int32_t grass_id = 9;
+    int32_t dirt_id = 10;
+    int32_t water_id = 80;
+    int32_t sand_id = 112;
+    int32_t oak_log_id = 131;
+    int32_t oak_leaves_id = 264;
+
+    memset(bs, 0, sizeof(*bs));
+    memset(palette_indices, 0, sizeof(palette_indices));
+    memset(longs, 0, sizeof(longs));
+
+    for (int ly = 0; ly < 16; ++ly) {
+        int32_t world_y = y_base + ly;
+        for (int lz = 0; lz < 16; ++lz) {
+            for (int lx = 0; lx < 16; ++lx) {
+                int32_t world_x = chunk_x * 16 + lx;
+                int32_t world_z = chunk_z * 16 + lz;
+                int32_t surface_y = generated_world_surface_y(world_x, world_z);
+                int32_t block_id = air_id;
+                int32_t tree_block_id;
+                int idx = (ly << 8) | (lz << 4) | lx;
+                int palette_index = 0;
+
+                if (world_y <= surface_y) {
+                    if (world_y == surface_y) {
+                        block_id = (surface_y <= GENERATED_SEA_LEVEL + 1) ? sand_id : grass_id;
+                    } else if (world_y >= surface_y - 3) {
+                        block_id = (surface_y <= GENERATED_SEA_LEVEL + 3) ? sand_id : dirt_id;
+                    } else {
+                        block_id = stone_id;
+                    }
+                } else if (world_y <= GENERATED_SEA_LEVEL) {
+                    block_id = water_id;
+                } else {
+                    tree_block_id = generated_world_tree_block(world_x,
+                                                               world_y,
+                                                               world_z,
+                                                               oak_log_id,
+                                                               oak_leaves_id);
+                    if (tree_block_id != air_id) {
+                        block_id = tree_block_id;
+                    }
+                }
+
+                for (palette_index = 0; palette_index < palette_size; ++palette_index) {
+                    if (palette_ids[palette_index] == block_id) {
+                        break;
+                    }
+                }
+                if (palette_index == palette_size) {
+                    if (palette_size >= 8) {
+                        return 0;
+                    }
+                    palette_ids[palette_size++] = block_id;
+                }
+
+                palette_indices[idx] = (uint8_t)palette_index;
+                if (block_id != air_id) {
+                    non_air += 1;
+                }
+            }
+        }
+    }
+
+    if (non_air_count != NULL) {
+        *non_air_count = non_air;
+    }
+
+    bs->palette_size = palette_size;
+    for (int i = 0; i < palette_size; ++i) {
+        bs->global_ids[i] = palette_ids[i];
+    }
+
+    if (palette_size <= 1) {
+        bs->data_ptr = NULL;
+        bs->data_count = 0;
+        return 1;
+    }
+
+    bits = ceil_log2_i(palette_size);
+    if (bits < 4) {
+        bits = 4;
+    }
+
+    long_count = (uint32_t)((4096 * bits + 63) / 64);
+    for (int i = 0; i < 4096; ++i) {
+        uint32_t bit_index = (uint32_t)i * (uint32_t)bits;
+        uint32_t long_index = bit_index >> 6;
+        uint32_t start_bit = bit_index & 63u;
+        uint64_t value = (uint64_t)palette_indices[i];
+
+        longs[long_index] |= value << start_bit;
+        if (start_bit + (uint32_t)bits > 64u && long_index + 1u < long_count) {
+            longs[long_index + 1u] |= value >> (64u - start_bit);
+        }
+    }
+
+    for (uint32_t i = 0; i < long_count; ++i) {
+        write_u64_be_ptr(packed_out + (size_t)i * 8u, longs[i]);
+    }
+
+    bs->data_ptr = packed_out;
+    bs->data_count = long_count;
+    return 1;
+}
+
+uint8_t *build_generated_overworld_chunk_packet(int32_t chunk_x, int32_t chunk_z,
+                                                size_t *out_len) {
+    dynbuf_t b;
+    chunk_section_t sections[NUM_SECTIONS];
+    uint8_t packed_data[NUM_SECTIONS][256 * 8];
+    uint16_t non_air_counts[NUM_SECTIONS];
+
+    memset(&b, 0, sizeof(b));
+    memset(sections, 0, sizeof(sections));
+    memset(packed_data, 0, sizeof(packed_data));
+    memset(non_air_counts, 0, sizeof(non_air_counts));
+
+    if (!out_len) {
+        return NULL;
+    }
+
+    for (int i = 0; i < NUM_SECTIONS; ++i) {
+        sections[i].valid = 1;
+        if (!build_generated_section(&sections[i].bs,
+                                     &non_air_counts[i],
+                                     packed_data[i],
+                                     chunk_x,
+                                     chunk_z,
+                                     i)) {
+            goto fail;
+        }
+    }
+
+    if (!db_varint(&b, 0x2C)) goto fail;
+    if (!db_be32(&b, (uint32_t)chunk_x)) goto fail;
+    if (!db_be32(&b, (uint32_t)chunk_z)) goto fail;
+
+    {
+        static uint8_t hm_zero[37 * 8] = {0};
+        hm_array_t hm_safe = {hm_zero, 37};
+        if (!write_heightmaps(&b, &hm_safe, &hm_safe)) goto fail;
+    }
+
+    {
+        size_t data_len_pos = b.len;
+        size_t data_start;
+        if (!dynbuf_grow(&b, 5)) goto fail;
+        b.len += 5;
+        data_start = b.len;
+
+        for (int i = 0; i < NUM_SECTIONS; ++i) {
+            if (!db_be16(&b, non_air_counts[i])) goto fail;
+            if (!write_bs_container(&b, &sections[i].bs)) goto fail;
+            if (!write_biome_container(&b)) goto fail;
+        }
+
+        {
+            size_t data_bytes = b.len - data_start;
+            uint8_t vi[5];
+            size_t vi_len = write_varint(vi, (int32_t)data_bytes);
+            size_t shift = 5 - vi_len;
+            if (shift > 0) {
+                memmove(b.data + data_len_pos + vi_len,
+                        b.data + data_start,
+                        data_bytes);
+                b.len -= shift;
+            }
+            memcpy(b.data + data_len_pos, vi, vi_len);
+        }
+    }
+
+    if (!db_varint(&b, 0)) goto fail;
     if (!write_light_data(&b)) goto fail;
 
     *out_len = b.len;

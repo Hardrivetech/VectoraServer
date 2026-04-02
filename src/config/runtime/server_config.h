@@ -10,6 +10,13 @@ enum {
     ONLINE_PLAYERS_MODE_CONNECTED = 2
 };
 
+enum {
+    WORLD_SOURCE_MODE_AUTO = 0,
+    WORLD_SOURCE_MODE_REAL = 1,
+    WORLD_SOURCE_MODE_GENERATED = 2,
+    WORLD_SOURCE_MODE_DEBUG = 3
+};
+
 typedef struct {
     int port;
     int max_players;
@@ -35,6 +42,7 @@ typedef struct {
     int pvp_enabled;
     int spawn_protection_radius;
     game_rules_t game_rules;
+    int world_source_mode;
     int force_debug_spawn;
     int enable_real_chunks;
     int allow_debug_chunk_fallback;
