@@ -439,7 +439,7 @@ void set_server_config_defaults(server_config_t *config) {
     config->compression_threshold = 256;
     config->chunk_stream_radius = 0;
     config->keep_alive_interval_seconds = 10;
-    config->play_idle_timeout_seconds = 30;
+    config->play_idle_timeout_seconds = 0;
     config->idle_timeout_counts_keep_alive = 0;
     config->serverbound_keep_alive_packet_id = 0x13;
     config->idle_timeout_requires_position_change = 1;

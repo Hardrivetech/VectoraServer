@@ -352,3 +352,37 @@ size_t build_set_entity_glowing_packet(uint8_t *outbuf,
 
     return offset;
 }
+
+// Set Entity Metadata (0x61 / set_entity_data) for item entities.
+// Writes metadata index 8 (Slot) so dropped item entities render on the client.
+size_t build_set_item_entity_slot_packet(uint8_t *outbuf,
+                                         size_t outbuf_size,
+                                         int32_t entity_id,
+                                         int32_t item_id,
+                                         int32_t item_count) {
+    size_t offset = 0;
+
+    (void)outbuf_size;
+
+    if (item_count <= 0) {
+        return 0;
+    }
+
+    offset += write_varint(outbuf + offset, PLAY774_PKT_SET_ENTITY_METADATA);
+    offset += write_varint(outbuf + offset, entity_id);
+
+    // Metadata entry: index=8 (Item entity slot), type=7 (Slot).
+    outbuf[offset++] = 0x08;
+    offset += write_varint(outbuf + offset, 7);
+
+    // Slot format (1.21+): count, item id, add component count, remove component count.
+    offset += write_varint(outbuf + offset, item_count);
+    offset += write_varint(outbuf + offset, item_id);
+    offset += write_varint(outbuf + offset, 0);
+    offset += write_varint(outbuf + offset, 0);
+
+    // Metadata terminator.
+    outbuf[offset++] = 0xFF;
+
+    return offset;
+}

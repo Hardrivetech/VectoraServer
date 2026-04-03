@@ -5,6 +5,8 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
+#include <signal.h>
+#include <stdarg.h>
 #include "protocol.h"
 #include "packet.h"
 #include "configuration_packets.h"
@@ -25,6 +27,7 @@
 #include <ws2tcpip.h>
 #include <direct.h>
 #include <sys/stat.h>
+#include <stddef.h>
 #pragma comment(lib, "ws2_32.lib")
 typedef SOCKET socket_handle_t;
 #else
@@ -59,13 +62,43 @@ static int g_log_chunk_sends = 1;
 #define PLAY774_C2S_CHAT_COMMAND        0x06
 #define PLAY774_C2S_CHAT_COMMAND_SIGNED 0x07
 #define PLAY774_C2S_CHAT_MESSAGE        0x08
+#define PLAY774_C2S_BLOCK_DIG           0x28
 #define PLAY774_S2C_SYSTEM_CHAT         0x77
+#define PLAY774_ENTITY_TYPE_ITEM        71
+#define PLAY774_ITEM_ID_STONE           1
+#define PLAY774_BLOCK_DIG_START         0
+#define PLAY774_BLOCK_DIG_FINISH        2
 #define CHAT_RATE_MAX_MESSAGES          5
 #define CHAT_RATE_WINDOW_SECONDS        3
 #define CHAT_RATE_BLOCK_BASE_SECONDS    10
 #define CHAT_RATE_BLOCK_MAX_SECONDS     120
 #define CHAT_RATE_STRIKE_DECAY_SECONDS  300
-#define GENERATED_PACKET_CACHE_VERSION  17
+#define GENERATED_PACKET_CACHE_VERSION  18
+#define DROP_DEDUP_CACHE_SIZE           64
+#define DROP_DEDUP_WINDOW_SECONDS       2
+
+#ifdef _WIN32
+static socket_handle_t g_listen_socket = INVALID_SOCKET;
+#else
+static socket_handle_t g_listen_socket = -1;
+#endif
+
+static void append_lifecycle_log(const char *fmt, ...) {
+    FILE *f;
+    va_list ap;
+
+    f = fopen("lifecycle.log", "a");
+    if (f == NULL) {
+        return;
+    }
+
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "\n");
+    fflush(f);
+    fclose(f);
+}
 
 static socket_handle_t g_play_chat_sockets[MAX_PLAY_CHAT_SOCKETS];
 static char g_play_chat_socket_usernames[MAX_PLAY_CHAT_SOCKETS][32];
@@ -102,6 +135,37 @@ static void destroy_play_chat_lock(void) {}
 #ifdef _WIN32
 static volatile LONG g_connected_play_sessions = 0;
 static volatile LONG g_active_connections = 0;
+
+static LONG WINAPI vectora_unhandled_exception_filter(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    fprintf(stderr, "[FATAL] Unhandled process exception (code=0x%08lX).\n", (unsigned long)code);
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void vectora_invalid_parameter_handler(const wchar_t *expression,
+                                              const wchar_t *function,
+                                              const wchar_t *file,
+                                              unsigned int line,
+                                              uintptr_t pReserved) {
+    (void)expression;
+    (void)function;
+    (void)file;
+    (void)pReserved;
+    fprintf(stderr, "[FATAL] CRT invalid parameter handler triggered (line=%u).\n", line);
+    fflush(stderr);
+}
+
+static void vectora_signal_handler(int sig) {
+    fprintf(stderr, "[FATAL] Signal handler invoked (signal=%d).\n", sig);
+    fflush(stderr);
+}
+
+static void vectora_process_exit_marker(void) {
+    fprintf(stderr, "[INFO] Process exiting via normal atexit path.\n");
+    fflush(stderr);
+}
+
 static int load_connected_play_sessions(void) {
     return (int)InterlockedCompareExchange(&g_connected_play_sessions, 0, 0);
 }
@@ -152,6 +216,13 @@ typedef struct {
 } client_stream_state_t;
 
 typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+    time_t at;
+} recent_drop_entry_t;
+
+typedef struct {
     socket_handle_t socket_fd;
     socket_handle_t server_fd;
     server_config_t server_config;
@@ -178,6 +249,8 @@ typedef struct {
     time_t chat_rate_block_until;
     int chat_rate_strike_count;
     time_t chat_rate_last_violation;
+    recent_drop_entry_t recent_drops[DROP_DEDUP_CACHE_SIZE];
+    size_t recent_drop_count;
 } client_session_t;
 
 typedef enum {
@@ -301,6 +374,62 @@ static int find_tracked_spawned_entity_index(const client_session_t *session, in
     }
 
     return -1;
+}
+
+static int should_spawn_block_drop(client_session_t *session,
+                                   int32_t block_x,
+                                   int32_t block_y,
+                                   int32_t block_z,
+                                   time_t now_ts) {
+    size_t i;
+    size_t oldest_index = 0;
+    time_t oldest_time = now_ts;
+
+    if (session == NULL) {
+        return 0;
+    }
+
+    if (session->recent_drop_count == 0) {
+        session->recent_drops[0].x = block_x;
+        session->recent_drops[0].y = block_y;
+        session->recent_drops[0].z = block_z;
+        session->recent_drops[0].at = now_ts;
+        session->recent_drop_count = 1;
+        return 1;
+    }
+
+    oldest_time = session->recent_drops[0].at;
+    for (i = 0; i < session->recent_drop_count; ++i) {
+        recent_drop_entry_t *entry = &session->recent_drops[i];
+
+        if (entry->x == block_x && entry->y == block_y && entry->z == block_z) {
+            if ((now_ts - entry->at) <= DROP_DEDUP_WINDOW_SECONDS) {
+                return 0;
+            }
+            entry->at = now_ts;
+            return 1;
+        }
+
+        if (entry->at < oldest_time) {
+            oldest_time = entry->at;
+            oldest_index = i;
+        }
+    }
+
+    if (session->recent_drop_count < DROP_DEDUP_CACHE_SIZE) {
+        session->recent_drops[session->recent_drop_count].x = block_x;
+        session->recent_drops[session->recent_drop_count].y = block_y;
+        session->recent_drops[session->recent_drop_count].z = block_z;
+        session->recent_drops[session->recent_drop_count].at = now_ts;
+        session->recent_drop_count += 1;
+        return 1;
+    }
+
+    session->recent_drops[oldest_index].x = block_x;
+    session->recent_drops[oldest_index].y = block_y;
+    session->recent_drops[oldest_index].z = block_z;
+    session->recent_drops[oldest_index].at = now_ts;
+    return 1;
 }
 
 static int username_equals_ci(const char *a, const char *b) {
@@ -962,39 +1091,56 @@ static int read_post_compression_packet_data(const uint8_t *buf,
                                              size_t inflate_buf_size) {
     const uint8_t *p = buf;
     size_t len = buf_len;
+    int32_t packet_len = -1;
+    int32_t data_len = -1;
 
-    if (buf == NULL || out_packet_id == NULL || out_payload == NULL || out_payload_len == NULL) {
+    if (buf == NULL || out_packet_id == NULL || out_payload == NULL || out_payload_len == NULL ||
+        inflate_buf == NULL || inflate_buf_size == 0) {
         return 0;
     }
 
-    (void)read_varint(&p, &len);
+    packet_len = read_varint(&p, &len);
+    if (packet_len < 0) {
+        return 0;
+    }
+
+    if ((size_t)packet_len > len) {
+        return 0;
+    }
+
+    len = (size_t)packet_len;
     if (len == 0) {
         return 0;
     }
 
-    {
-        int32_t data_len = read_varint(&p, &len);
-        if (data_len < 0) {
+    data_len = read_varint(&p, &len);
+    if (data_len < 0) {
+        return 0;
+    }
+
+    if (data_len == 0) {
+        const uint8_t *payload_ptr = p;
+        size_t payload_len = len;
+        *out_packet_id = read_varint(&payload_ptr, &payload_len);
+        if (*out_packet_id < 0) {
             return 0;
         }
-
-        if (data_len == 0) {
-            const uint8_t *payload_ptr = p;
-            size_t payload_len = len;
-            *out_packet_id = read_varint(&payload_ptr, &payload_len);
-            if ((int)*out_packet_id < 0) {
-                return 0;
-            }
-            *out_payload = payload_ptr;
-            *out_payload_len = payload_len;
-            return 1;
-        }
+        *out_payload = payload_ptr;
+        *out_payload_len = payload_len;
+        return 1;
     }
 
     {
         uLongf inflated_len = (uLongf)inflate_buf_size;
+        if ((size_t)data_len > inflate_buf_size) {
+            return 0;
+        }
         int zres = uncompress(inflate_buf, &inflated_len, p, (uLong)len);
         if (zres != Z_OK || inflated_len == 0) {
+            return 0;
+        }
+
+        if ((int32_t)inflated_len != data_len) {
             return 0;
         }
 
@@ -1023,6 +1169,9 @@ static int try_extract_position_from_play_packet(int32_t packet_id,
      * revisions. Position packets always start with x,y,z doubles.
      */
     int is_position_packet =
+        // protocol 774 (1.21.11)
+        (packet_id == 0x1D) || (packet_id == 0x1E) ||
+        // nearby protocol revisions / fallback compatibility
         (packet_id == 0x1A) || (packet_id == 0x1B) ||
         (packet_id == 0x15) || (packet_id == 0x16);
 
@@ -1033,6 +1182,69 @@ static int try_extract_position_from_play_packet(int32_t packet_id,
     *out_x = read_be_double_ptr(payload);
     *out_y = read_be_double_ptr(payload + 8);
     *out_z = read_be_double_ptr(payload + 16);
+    return 1;
+}
+
+static void decode_packed_block_position(uint64_t packed,
+                                         int32_t *out_x,
+                                         int32_t *out_y,
+                                         int32_t *out_z) {
+    int32_t x = (int32_t)((packed >> 38) & 0x3FFFFFFu);
+    int32_t y = (int32_t)(packed & 0xFFFu);
+    int32_t z = (int32_t)((packed >> 12) & 0x3FFFFFFu);
+
+    if (x >= (1 << 25)) x -= (1 << 26);
+    if (y >= (1 << 11)) y -= (1 << 12);
+    if (z >= (1 << 25)) z -= (1 << 26);
+
+    if (out_x != NULL) *out_x = x;
+    if (out_y != NULL) *out_y = y;
+    if (out_z != NULL) *out_z = z;
+}
+
+static int try_parse_block_dig_packet_774(const uint8_t *payload,
+                                          size_t payload_len,
+                                          int32_t *out_status,
+                                          int32_t *out_x,
+                                          int32_t *out_y,
+                                          int32_t *out_z) {
+    const uint8_t *p = payload;
+    size_t len = payload_len;
+    int32_t status;
+    uint64_t packed_pos;
+
+    if (payload == NULL || out_status == NULL || out_x == NULL || out_y == NULL || out_z == NULL) {
+        return 0;
+    }
+
+    status = read_varint(&p, &len);
+    if (status < 0 || len < 10) {
+        return 0;
+    }
+
+    packed_pos =
+        ((uint64_t)p[0] << 56) |
+        ((uint64_t)p[1] << 48) |
+        ((uint64_t)p[2] << 40) |
+        ((uint64_t)p[3] << 32) |
+        ((uint64_t)p[4] << 24) |
+        ((uint64_t)p[5] << 16) |
+        ((uint64_t)p[6] << 8) |
+        (uint64_t)p[7];
+    p += 8;
+    len -= 8;
+
+    /* face (i8) */
+    p += 1;
+    len -= 1;
+
+    /* sequence (varint) */
+    if (read_varint(&p, &len) < 0) {
+        return 0;
+    }
+
+    *out_status = status;
+    decode_packed_block_position(packed_pos, out_x, out_y, out_z);
     return 1;
 }
 
@@ -1504,7 +1716,25 @@ static int send_stream_chunk(client_session_t *session,
 
     if (!sent_this && (world_source_mode == WORLD_SOURCE_MODE_AUTO || world_source_mode == WORLD_SOURCE_MODE_GENERATED)) {
         size_t gen_len = 0;
+        fprintf(stderr, "[CHUNK_SEND] Calling build_generated_overworld_chunk_packet for (%d,%d)\n", chunk_x, chunk_z);
+        fflush(stderr);
+        
+        FILE *gen_log = fopen("chunk_generate.log", "a");
+        if (gen_log) {
+            fprintf(gen_log, "[CHUNK_SEND] START generating chunk (%d,%d)\n", chunk_x, chunk_z);
+            fflush(gen_log);
+            fclose(gen_log);
+        }
+        
         uint8_t *gen_buf = build_generated_overworld_chunk_packet(chunk_x, chunk_z, &gen_len);
+        
+        FILE *gen_log2 = fopen("chunk_generate.log", "a");
+        if (gen_log2) {
+            fprintf(gen_log2, "[CHUNK_SEND] END generating chunk (%d,%d), result=%s\n", chunk_x, chunk_z, gen_buf ? "SUCCESS" : "NULL");
+            fflush(gen_log2);
+            fclose(gen_log2);
+        }
+        
         if (gen_buf == NULL) {
             uint8_t *chunk_nbt = NULL;
             size_t chunk_nbt_len = 0;
@@ -2821,18 +3051,30 @@ static void prewarm_generated_chunk_cache(const server_config_t *server_config,
 
             {
                 size_t packet_len = 0;
+                fprintf(stderr, "[PLAY] Generating chunk (%d,%d)...\n", chunk_x, chunk_z);
+                fflush(stderr);
                 uint8_t *packet = build_generated_overworld_chunk_packet(chunk_x, chunk_z, &packet_len);
                 if (packet == NULL) {
+                    fprintf(stderr, "[PLAY] build_generated_overworld_chunk_packet returned NULL for (%d,%d), trying fallback...\n", chunk_x, chunk_z);
+                    fflush(stderr);
                     uint8_t *chunk_nbt = NULL;
                     size_t chunk_nbt_len = 0;
                     if (build_generated_chunk_nbt_payload(chunk_x, chunk_z, &chunk_nbt, &chunk_nbt_len)) {
+                        fprintf(stderr, "[PLAY] Using fallback build_chunk_data_packet for (%d,%d)\n", chunk_x, chunk_z);
+                        fflush(stderr);
                         packet = build_chunk_data_packet(chunk_nbt,
                                                          chunk_nbt_len,
                                                          chunk_x,
                                                          chunk_z,
                                                          &packet_len);
                         free(chunk_nbt);
+                    } else {
+                        fprintf(stderr, "[PLAY] build_generated_chunk_nbt_payload failed for (%d,%d)\n", chunk_x, chunk_z);
+                        fflush(stderr);
                     }
+                } else {
+                    fprintf(stderr, "[PLAY] Generated chunk (%d,%d) successfully, size=%zu\n", chunk_x, chunk_z, packet_len);
+                    fflush(stderr);
                 }
                 if (packet != NULL) {
                     save_cached_generated_chunk_packet(server_config,
@@ -2980,13 +3222,21 @@ static int load_config_replay_with_fallbacks(config_replay_t *replay, const char
 static int read_post_compression_packet_id(const uint8_t *buf, size_t buf_len, int32_t *out_packet_id) {
     const uint8_t *p = buf;
     size_t len = buf_len;
+    int32_t packet_len = -1;
 
     if (buf == NULL || out_packet_id == NULL || len == 0) {
         return 0;
     }
 
-    // Outer packet length (not used directly here, but must be consumed).
-    (void)read_varint(&p, &len);
+    // Outer packet length must be valid and fully present in this buffer.
+    packet_len = read_varint(&p, &len);
+    if (packet_len < 0) {
+        return 0;
+    }
+    if ((size_t)packet_len > len) {
+        return 0;
+    }
+    len = (size_t)packet_len;
     if (len == 0) {
         return 0;
     }
@@ -3002,14 +3252,24 @@ static int read_post_compression_packet_id(const uint8_t *buf, size_t buf_len, i
             return 0;
         }
         *out_packet_id = read_varint(&p, &len);
+        if (*out_packet_id < 0) {
+            return 0;
+        }
         return 1;
     }
 
     uint8_t inflated[8192];
     uLongf inflated_len = sizeof(inflated);
+    if ((size_t)data_len > sizeof(inflated)) {
+        return 0;
+    }
     int zres = uncompress(inflated, &inflated_len, p, (uLong)len);
     if (zres != Z_OK) {
         printf("[read_post_compression_packet_id] zlib uncompress error: %d\n", zres);
+        return 0;
+    }
+
+    if ((int32_t)inflated_len != data_len) {
         return 0;
     }
 
@@ -3020,6 +3280,9 @@ static int read_post_compression_packet_id(const uint8_t *buf, size_t buf_len, i
     }
 
     *out_packet_id = read_varint(&ip, &ilen);
+    if (*out_packet_id < 0) {
+        return 0;
+    }
     return 1;
 }
 
@@ -3352,6 +3615,17 @@ static void reconcile_entity_visibility(client_session_t *session,
                                                   0);
         send_post_compression_packet(socket_fd, se_buf, se_len);
         session->entity_stats_spawn_packets_sent += 1;
+        if (entity_type == PLAY774_ENTITY_TYPE_ITEM) {
+            uint8_t item_md_buf[64];
+            size_t item_md_len = build_set_item_entity_slot_packet(item_md_buf,
+                                                                   sizeof(item_md_buf),
+                                                                   entity_id,
+                                                                   PLAY774_ITEM_ID_STONE,
+                                                                   1);
+            if (item_md_len > 0) {
+                send_post_compression_packet(socket_fd, item_md_buf, item_md_len);
+            }
+        }
         if (glow) {
             uint8_t md_buf[32];
             size_t md_len = build_set_entity_glowing_packet(md_buf,
@@ -3447,6 +3721,22 @@ static void send_large_post_compression_packet(socket_handle_t socket_fd,
 
 static void close_client_socket(socket_handle_t socket_fd) {
 #ifdef _WIN32
+    if (socket_fd == g_listen_socket) {
+        fprintf(stderr, "[BUG] Refused attempt to close listening socket from client path.\n");
+        fflush(stderr);
+        append_lifecycle_log("[BUG] Refused close of listening socket handle=%llu", (unsigned long long)socket_fd);
+        return;
+    }
+#else
+    if (socket_fd == g_listen_socket) {
+        fprintf(stderr, "[BUG] Refused attempt to close listening socket from client path.\n");
+        fflush(stderr);
+        append_lifecycle_log("[BUG] Refused close of listening socket handle=%d", socket_fd);
+        return;
+    }
+#endif
+
+#ifdef _WIN32
     closesocket(socket_fd);
 #else
     close(socket_fd);
@@ -3462,6 +3752,18 @@ static int parse_handshake_next_state(const uint8_t *buffer,
     int32_t packet_length = read_varint(&ptr, &buflen);
     int32_t packet_id = read_varint(&ptr, &buflen);
 
+    if (buffer == NULL || out_protocol_version == NULL || out_next_state == NULL) {
+        return 0;
+    }
+
+    if (packet_length <= 0 || packet_id < 0 || (size_t)packet_length > buflen) {
+        *out_protocol_version = -1;
+        *out_next_state = -1;
+        return 0;
+    }
+
+    buflen = (size_t)packet_length;
+
     printf("Received packet: length=%d, id=%d\n", packet_length, packet_id);
     if (packet_id != 0x00) {
         *out_protocol_version = -1;
@@ -3473,11 +3775,23 @@ static int parse_handshake_next_state(const uint8_t *buffer,
         int32_t protocol_version = read_varint(&ptr, &buflen);
         extern char *read_mc_string(const uint8_t **, size_t *);
         char *server_address = read_mc_string(&ptr, &buflen);
+        if (protocol_version < 0 || server_address == NULL || buflen < 2) {
+            free(server_address);
+            *out_protocol_version = -1;
+            *out_next_state = -1;
+            return 0;
+        }
         uint16_t server_port = (uint16_t)(ptr[0] << 8 | ptr[1]);
         ptr += 2;
         buflen -= 2;
         *out_protocol_version = protocol_version;
         *out_next_state = read_varint(&ptr, &buflen);
+        if (*out_next_state < 0) {
+            free(server_address);
+            *out_protocol_version = -1;
+            *out_next_state = -1;
+            return 0;
+        }
         printf("Handshake: proto=%d, addr=%s, port=%u, next_state=%d\n", protocol_version, server_address, server_port, *out_next_state);
         free(server_address);
     }
@@ -3540,6 +3854,13 @@ static void run_play_state_loop(client_session_t *session,
                                 int has_world_info,
                                 int force_debug_spawn,
                                 world_info_t *world_info) {
+    // Allocate decompression buffer once, at function scope
+    uint8_t *inflate_tmp = (uint8_t *)malloc(8192);
+    if (!inflate_tmp) {
+        fprintf(stderr, "Failed to allocate inflate_tmp buffer\n");
+        return;
+    }
+
 #ifdef _WIN32
     {
         DWORD timeout_ms = 1000;
@@ -3589,6 +3910,11 @@ static void run_play_state_loop(client_session_t *session,
         int has_last_activity_position = 0;
         int64_t ka_id = 1;
         uint64_t tick = 0;  /* Game tick counter for deterministic entity updates */
+        
+        printf("Play session started: idle_timeout=%d seconds, keep_alive_interval=%d seconds\n",
+               session->server_config.play_idle_timeout_seconds,
+               session->server_config.keep_alive_interval_seconds);
+        fflush(stdout);
         for (;;) {
             #ifdef _WIN32
             Sleep(50);  /* 50ms = 20 TPS (ticks per second) */
@@ -3604,6 +3930,7 @@ static void run_play_state_loop(client_session_t *session,
                 send_post_compression_packet(socket_fd, ka_buf, ka_len);
                 keepalive_sent += 1;
                 printf("Sent Keep Alive (id=%lld).\n", (long long)(ka_id - 1));
+                fflush(stdout);
                 last_keepalive = now;
             }
 
@@ -3827,12 +4154,24 @@ static void run_play_state_loop(client_session_t *session,
             int play_bytes = recv(socket_fd, (char*)play_buf, sizeof(play_buf), 0);
             if (play_bytes <= 0) {
                 if (WSAGetLastError() == WSAETIMEDOUT) continue;
+                if (play_bytes == 0) {
+                    printf("[RECV] Socket closed by client (play_bytes=0)\n");
+                } else {
+                    printf("[RECV] Socket error: WSAGetLastError()=%d\n", WSAGetLastError());
+                }
                 break;
             }
 #else
             ssize_t play_bytes = recv(socket_fd, play_buf, sizeof(play_buf), 0);
+            printf("[RECV] recv() returned %zd\n", play_bytes);
+            fflush(stdout);
             if (play_bytes <= 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                if (play_bytes == 0) {
+                    printf("[RECV] Socket closed by client (play_bytes=0)\n");
+                } else {
+                    printf("[RECV] Socket error: errno=%d (%s)\n", errno, strerror(errno));
+                }
                 break;
             }
 #endif
@@ -3841,7 +4180,6 @@ static void run_play_state_loop(client_session_t *session,
                 int32_t play_pid = -1;
                 const uint8_t *play_payload = NULL;
                 size_t play_payload_len = 0;
-                uint8_t inflate_tmp[8192];
 
                 if (read_post_compression_packet_data(
                         play_buf,
@@ -3850,7 +4188,7 @@ static void run_play_state_loop(client_session_t *session,
                         &play_payload,
                         &play_payload_len,
                         inflate_tmp,
-                        sizeof(inflate_tmp))) {
+                        8192)) {
                     int counts_as_activity = 1;
                     int has_position = 0;
                     double player_x = 0.0;
@@ -3904,14 +4242,122 @@ static void run_play_state_loop(client_session_t *session,
                                                               player_x,
                                                               player_y,
                                                               player_z);
+
+                        /* Auto-pickup for dropped item entities near the player. */
+                        {
+                            const double pickup_radius_sq = 2.25; /* 1.5 blocks */
+                            size_t i = 0;
+                            while (i < session->spawned_entity_count) {
+                                int32_t ent_id = session->spawned_entity_ids[i];
+                                int32_t ent_type = session->spawned_entity_types[i];
+                                double ex = 0.0, ey = 0.0, ez = 0.0;
+
+                                if (ent_type != PLAY774_ENTITY_TYPE_ITEM) {
+                                    i += 1;
+                                    continue;
+                                }
+
+                                if (!find_entity_position(&session->entity_registry, ent_id, &ex, &ey, &ez)) {
+                                    (void)untrack_spawned_entity_id(session, ent_id);
+                                    continue;
+                                }
+
+                                {
+                                    double dx = player_x - ex;
+                                    double dy = player_y - ey;
+                                    double dz = player_z - ez;
+                                    double dist_sq = dx * dx + dy * dy + dz * dz;
+
+                                    if (dist_sq <= pickup_radius_sq) {
+                                        uint8_t rem_buf[64];
+                                        size_t rem_len = build_entity_destroy_packet(rem_buf,
+                                                                                     sizeof(rem_buf),
+                                                                                     &ent_id,
+                                                                                     1);
+                                        send_post_compression_packet(socket_fd, rem_buf, rem_len);
+                                        session->entity_stats_destroy_packets_sent += 1;
+                                        (void)entity_manager_queue_remove(&session->entity_registry,
+                                                                          &session->entity_manager,
+                                                                          ent_id);
+                                        (void)untrack_spawned_entity_id(session, ent_id);
+                                        continue;
+                                    }
+                                }
+
+                                i += 1;
+                            }
+                        }
                     }
+
+                    if (play_pid == PLAY774_C2S_BLOCK_DIG) {
+                        int32_t dig_status = -1;
+                        int32_t block_x = 0, block_y = 0, block_z = 0;
+
+                            if (try_parse_block_dig_packet_774(play_payload,
+                                                        play_payload_len,
+                                                        &dig_status,
+                                                        &block_x,
+                                                        &block_y,
+                                                        &block_z) &&
+                               (dig_status == PLAY774_BLOCK_DIG_FINISH ||
+                                (dig_status == PLAY774_BLOCK_DIG_START && session->server_config.game_mode == 1))) {
+                            int32_t drop_entity_id = 0;
+                            double drop_x = (double)block_x + 0.5;
+                            double drop_y = (double)block_y + 0.5;
+                            double drop_z = (double)block_z + 0.5;
+
+                            if (should_spawn_block_drop(session,
+                                                        block_x,
+                                                        block_y,
+                                                        block_z,
+                                                        time(NULL)) &&
+                                entity_manager_queue_spawn_auto(&session->entity_registry,
+                                                                &session->entity_manager,
+                                                                ENTITY_KIND_OBJECT,
+                                                                drop_x,
+                                                                drop_y,
+                                                                drop_z,
+                                                                &drop_entity_id)) {
+                                uint8_t se_buf[128];
+                                size_t se_len;
+
+                                (void)track_spawned_entity_id(session,
+                                                              drop_entity_id,
+                                                              PLAY774_ENTITY_TYPE_ITEM);
+
+                                se_len = build_spawn_entity_packet(se_buf,
+                                                                   sizeof(se_buf),
+                                                                   drop_entity_id,
+                                                                   PLAY774_ENTITY_TYPE_ITEM,
+                                                                   drop_x,
+                                                                   drop_y,
+                                                                   drop_z,
+                                                                   0,
+                                                                   0,
+                                                                   0,
+                                                                   0);
+                                send_post_compression_packet(socket_fd, se_buf, se_len);
+                                {
+                                    uint8_t item_md_buf[64];
+                                    size_t item_md_len = build_set_item_entity_slot_packet(item_md_buf,
+                                                                                           sizeof(item_md_buf),
+                                                                                           drop_entity_id,
+                                                                                           PLAY774_ITEM_ID_STONE,
+                                                                                           1);
+                                    if (item_md_len > 0) {
+                                        send_post_compression_packet(socket_fd, item_md_buf, item_md_len);
+                                    }
+                                }
+                                session->entity_stats_spawn_packets_sent += 1;
+                            }
+                        }
+                    }
+
                     if (g_log_play_packets) {
                         printf("Play packet ID from client: %d\n", play_pid);
                     }
 
-                    if (session->server_config.enable_experimental_entities &&
-                        session->server_config.enable_experimental_entity_packets &&
-                        session->client_protocol_version == 774) {
+                    if (session->client_protocol_version == 774) {
                         char command_text[256];
                         int have_command_text = 0;
                         const uint8_t *cmd_payload = play_payload;
@@ -4254,6 +4700,17 @@ static void run_play_state_loop(client_session_t *session,
                                                                                    0);
                                                 send_post_compression_packet(socket_fd, se_buf, se_len);
                                                 session->entity_stats_spawn_packets_sent += 1;
+                                                if (entity_type == PLAY774_ENTITY_TYPE_ITEM) {
+                                                    uint8_t item_md_buf[64];
+                                                    size_t item_md_len = build_set_item_entity_slot_packet(item_md_buf,
+                                                                                                           sizeof(item_md_buf),
+                                                                                                           new_entity_id,
+                                                                                                           PLAY774_ITEM_ID_STONE,
+                                                                                                           1);
+                                                    if (item_md_len > 0) {
+                                                        send_post_compression_packet(socket_fd, item_md_buf, item_md_len);
+                                                    }
+                                                }
                                                 if (spawn_glow) {
                                                     uint8_t md_buf[32];
                                                     size_t md_len = build_set_entity_glowing_packet(md_buf, sizeof(md_buf), new_entity_id, 1);
@@ -4538,7 +4995,10 @@ static void run_play_state_loop(client_session_t *session,
         }
 
         if (session->server_config.log_play_session_summary) {
-                 printf("Play session summary: reason=%s, keepalives_sent=%llu, packets_received=%llu, packets_parsed=%llu, packets_parse_failed=%llu, tracked_entities=%zu, pending_entity_events=%zu, dropped_entity_events=%zu\n",
+            time_t session_now = time(NULL);
+            int session_duration = (int)(session_now - last_client_activity) + 1;  // Rough estimate using client activity time
+                 printf("Play session summary: username=%s, reason=%s, keepalives_sent=%llu, packets_received=%llu, packets_parsed=%llu, packets_parse_failed=%llu, tracked_entities=%zu, pending_entity_events=%zu, dropped_entity_events=%zu\n",
+                   session->username,
                    idle_timeout_triggered ? "idle-timeout" : "socket-closed",
                    (unsigned long long)keepalive_sent,
                    (unsigned long long)play_packets_received,
@@ -4547,6 +5007,7 @@ static void run_play_state_loop(client_session_t *session,
                    entity_registry_count(&session->entity_registry),
                      entity_manager_pending_count(&session->entity_manager),
                      entity_manager_dropped_count(&session->entity_manager));
+            fflush(stdout);
         }
 
         entity_manager_clear(&session->entity_manager);
@@ -4562,6 +5023,11 @@ static void run_play_state_loop(client_session_t *session,
             decrement_connected_play_sessions();
         }
     }
+    
+    // Free the decompression buffer allocated at session start
+    if (inflate_tmp) {
+        free(inflate_tmp);
+    }
 
     (void)server_fd;
     (void)has_world_info;
@@ -4573,7 +5039,7 @@ static void handle_client_connection(client_session_t *session) {
     socket_handle_t server_fd = session->server_fd;
     server_config_t server_config = session->server_config;
 
-    // Read handshake packet (blocking, simple version)
+    // Read initial packet(s) - may contain both handshake and login start
     uint8_t buffer[1024];
 #ifdef _WIN32
     int bytes_read = recv(new_socket, (char*)buffer, sizeof(buffer), 0);
@@ -4585,55 +5051,150 @@ static void handle_client_connection(client_session_t *session) {
         return;
     }
 
+    // Parse handshake and track consumed bytes
     {
         int32_t protocol_version = -1;
         int32_t next_state = -1;
-        if (!parse_handshake_next_state(buffer, (size_t)bytes_read, &protocol_version, &next_state)) {
+        const uint8_t *hs_ptr = buffer;
+        size_t hs_len = bytes_read;
+        
+        if (!parse_handshake_next_state(hs_ptr, hs_len, &protocol_version, &next_state)) {
             close_client_socket(new_socket);
             return;
         }
 
         session->client_protocol_version = protocol_version;
+        printf("[HANDSHAKE] Parsed: proto=%d, next_state=%d\n", protocol_version, next_state);
 
         if (next_state == 1) {
+            printf("[HANDSHAKE] next_state=1 (STATUS), calling handle_status_state\n");
             handle_status_state(new_socket, &server_config);
+            printf("[HANDSHAKE] handle_status_state completed, closing socket\n");
             close_client_socket(new_socket);
             return;
         }
 
         if (next_state != 2) {
+            printf("[HANDSHAKE] next_state=%d (invalid, expected 1 or 2), closing socket\n", next_state);
+            close_client_socket(new_socket);
+            return;
+        }
+        printf("[HANDSHAKE] next_state=2 (LOGIN), proceeding to login phase\n");
+    }
+
+    // Set recv timeout on socket for login phase
+    {
+#ifdef _WIN32
+        DWORD timeout_ms = 5000;  // 5-second timeout
+        setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout_ms, sizeof(timeout_ms));
+#else
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    }
+
+    // Login Start packet may already be in buffer (if client sent handshake+login together)
+    // So we need to parse from the buffer first, then recv() if needed
+    uint8_t login_buf[1024];
+#ifdef _WIN32
+    int login_bytes = 0;
+#else
+    ssize_t login_bytes = 0;
+#endif
+    {
+        // We need to properly skip the entire handshake packet
+        // Handshake format: [VarInt length][VarInt protocol][VarInt addr_len][String addr][UShort port][VarInt next_state]
+        const uint8_t *parse_ptr = buffer;
+        size_t parse_len = bytes_read;
+        
+        // Skip handshake length varint
+        int32_t hs_packet_len = read_varint(&parse_ptr, &parse_len);
+        printf("[LOGIN] Handshake packet length: %d\n", hs_packet_len);
+
+        if (hs_packet_len <= 0) {
+            printf("[LOGIN] Invalid handshake packet length: %d\n", hs_packet_len);
+            close_client_socket(new_socket);
+            return;
+        }
+        
+        // Skip handshake contents (protocol + address + port + next_state)
+        // This is approximately hs_packet_len bytes
+        if (parse_len >= (size_t)hs_packet_len) {
+            parse_ptr += hs_packet_len;
+            parse_len -= hs_packet_len;
+            printf("[LOGIN] After skipping handshake, found %zd bytes remaining\n", parse_len);
+        } else {
+            printf("[LOGIN] WARNING: handshake length (%d) exceeds remaining buffer (%zd)\n", hs_packet_len, parse_len);
+        }
+        
+        // Now parse_ptr should be at the start of Login Start packet
+        if (parse_len > 0) {
+            // We have data after the handshake - copy it to login_buf
+            login_bytes = parse_len;
+            memcpy(login_buf, parse_ptr, parse_len);
+            printf("[LOGIN] Found %zd bytes after handshake (hex):", parse_len);
+            for (size_t i = 0; i < (parse_len < 20 ? parse_len : 20); i++) printf(" %02X", parse_ptr[i]);
+            if (parse_len > 20) printf(" ...");
+            printf("\n");
+        }
+    }
+
+    // If we didn't find login start in buffer, recv() it now
+    if (login_bytes <= 0) {
+        printf("[LOGIN] No data after handshake, waiting for Login Start packet...\n");
+#ifdef _WIN32
+        login_bytes = recv(new_socket, (char*)login_buf, sizeof(login_buf), 0);
+#else
+        login_bytes = recv(new_socket, login_buf, sizeof(login_buf), 0);
+#endif
+        if (login_bytes <= 0) {
+            if (login_bytes == 0) {
+                printf("[LOGIN] Socket closed (login_bytes=0)\n");
+            } else {
+#ifdef _WIN32
+                printf("[LOGIN] recv timeout/error: WSAGetLastError()=%d\n", WSAGetLastError());
+#else
+                printf("[LOGIN] recv timeout/error: errno=%d (%s)\n", errno, strerror(errno));
+#endif
+            }
             close_client_socket(new_socket);
             return;
         }
     }
 
-    // Wait for Login Start packet (id 0x00)
     {
-        uint8_t login_buf[1024];
-#ifdef _WIN32
-        int login_bytes = recv(new_socket, (char*)login_buf, sizeof(login_buf), 0);
-#else
-        ssize_t login_bytes = recv(new_socket, login_buf, sizeof(login_buf), 0);
-#endif
-        if (login_bytes <= 0) {
+        const uint8_t *lptr = login_buf;
+        size_t llen = login_bytes;
+        printf("[LOGIN] Parsing %zd bytes from login_buf (hex):", llen);
+        for (size_t i = 0; i < (llen < 20 ? llen : 20); i++) printf(" %02X", lptr[i]);
+        if (llen > 20) printf(" ...");
+        printf("\n");
+        
+        int32_t lplen = read_varint(&lptr, &llen);
+        printf("[LOGIN] Packet length varint: %d, remaining: %zd\n", lplen, llen);
+
+        if (lplen <= 0 || (size_t)lplen > llen) {
+            printf("[LOGIN] ERROR: invalid login packet length %d (remaining=%zd)\n", lplen, llen);
             close_client_socket(new_socket);
             return;
         }
 
-        {
-            const uint8_t *lptr = login_buf;
-            size_t llen = login_bytes;
-            int32_t lplen = read_varint(&lptr, &llen);
-            int32_t lpid = read_varint(&lptr, &llen);
-            (void)lplen;
-            if (lpid != 0x00) {
-                close_client_socket(new_socket);
-                return;
-            }
+        llen = (size_t)lplen;
+        
+        int32_t lpid = read_varint(&lptr, &llen);
+        printf("[LOGIN] Packet ID: 0x%02X, remaining: %zd\n", lpid, llen);
+        (void)lplen;
+        if (lpid != 0x00) {
+            printf("[LOGIN] ERROR: Expected packet ID 0x00 (Login Start), got 0x%02X\n", lpid);
+            close_client_socket(new_socket);
+            return;
+        }
 
-            // Parse username (MC String)
-            extern char *read_mc_string(const uint8_t **, size_t *);
-            {
+        // Parse username (MC String)
+        extern char *read_mc_string(const uint8_t **, size_t *);
+        {
                 char *username = read_mc_string(&lptr, &llen);
                 if (!username) {
                     close_client_socket(new_socket);
@@ -5459,14 +6020,26 @@ static void handle_client_connection(client_session_t *session) {
                 free(username);
             }
         }
-    }
 }
 
 #ifdef _WIN32
 static DWORD WINAPI client_worker_thread(LPVOID arg) {
     client_session_t *session = (client_session_t*)arg;
     if (session) {
-        handle_client_connection(session);
+        append_lifecycle_log("[THREAD] start socket=%llu", (unsigned long long)session->socket_fd);
+        __try {
+            handle_client_connection(session);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DWORD code = GetExceptionCode();
+            fprintf(stderr,
+                    "[FATAL] Unhandled exception in client worker thread (code=0x%08lX).\n",
+                    (unsigned long)code);
+            fflush(stderr);
+            if (session->socket_fd != INVALID_SOCKET) {
+                close_client_socket(session->socket_fd);
+            }
+        }
+        append_lifecycle_log("[THREAD] end socket=%llu", (unsigned long long)session->socket_fd);
         free(session);
     }
     decrement_active_connections();
@@ -5492,11 +6065,26 @@ int main() {
 
 #ifdef _WIN32
     WSADATA wsaData;
+
+    SetUnhandledExceptionFilter(vectora_unhandled_exception_filter);
+    _set_invalid_parameter_handler(vectora_invalid_parameter_handler);
+    signal(SIGABRT, vectora_signal_handler);
+    signal(SIGSEGV, vectora_signal_handler);
+    signal(SIGILL, vectora_signal_handler);
+    signal(SIGFPE, vectora_signal_handler);
+    signal(SIGTERM, vectora_signal_handler);
+    atexit(vectora_process_exit_marker);
+
     if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
         fprintf(stderr, "WSAStartup failed\n");
         exit(EXIT_FAILURE);
     }
 #endif
+    
+    /* Initialize light data early to avoid thread-safety issues */
+    extern void init_light_data_once(void);
+    init_light_data_once();
+    
     init_play_chat_lock();
     load_moderation_state();
 
@@ -5575,6 +6163,9 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    g_listen_socket = server_fd;
+    append_lifecycle_log("[MAIN] listen socket created handle=%llu", (unsigned long long)server_fd);
+
     // Attach socket to the configured port.
 #ifdef _WIN32
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt)) < 0) {
@@ -5610,14 +6201,26 @@ int main() {
         exit(EXIT_FAILURE);
     }
     printf("Vectora server listening on port %d...\n", server_config.port);
+    append_lifecycle_log("[MAIN] listening on port %d", server_config.port);
 
     while (1) {
         addrlen = sizeof(address);
-        new_socket = (int)accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+        new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+    #ifdef _WIN32
+        if (new_socket == INVALID_SOCKET) {
+    #else
         if (new_socket < 0) {
+    #endif
             perror("accept");
+    #ifdef _WIN32
+            append_lifecycle_log("[MAIN] accept failed WSA=%d", WSAGetLastError());
+    #else
+            append_lifecycle_log("[MAIN] accept failed errno=%d", errno);
+    #endif
             continue;
         }
+
+        append_lifecycle_log("[MAIN] accepted socket=%llu", (unsigned long long)new_socket);
 
         // Set TCP_NODELAY to disable Nagle's algorithm (immediate send)
 #ifdef _WIN32
@@ -5690,10 +6293,12 @@ int main() {
 
 #ifdef _WIN32
     closesocket(server_fd);
+    g_listen_socket = INVALID_SOCKET;
     (void)save_moderation_state();
     destroy_play_chat_lock();
     WSACleanup();
 #else
+    g_listen_socket = -1;
     (void)save_moderation_state();
     destroy_play_chat_lock();
 #endif

@@ -61,5 +61,10 @@ size_t build_set_entity_glowing_packet(uint8_t *outbuf,
                                        size_t outbuf_size,
                                        int32_t entity_id,
                                        int glowing);
+size_t build_set_item_entity_slot_packet(uint8_t *outbuf,
+                                         size_t outbuf_size,
+                                         int32_t entity_id,
+                                         int32_t item_id,
+                                         int32_t item_count);
 
 #endif

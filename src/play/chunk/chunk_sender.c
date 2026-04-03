@@ -130,7 +130,7 @@ static const block_entry_t BLOCK_TABLE[] = {
     {"minecraft:water",                86},
     {"minecraft:sand",               118},
     {"minecraft:oak_log",             137},
-    {"minecraft:oak_leaves",          278},  /* dist=7,persistent=true,waterlogged=false */
+    {"minecraft:oak_leaves",          279},  /* default oak_leaves state for 1.21.11 */
 
     /* --- cobblestone / planks ------------------------------------------ */
     {"minecraft:cobblestone",          14},
@@ -621,41 +621,114 @@ static int write_heightmaps(dynbuf_t *b,
 #define LIGHT_SECTIONS 26
 #define LIGHT_MASK     ((uint64_t)0x3FFFFFF) /* bits 0-25 set */
 
-static int write_light_data(dynbuf_t *b) {
-    static uint8_t sky_init = 0;
-    static uint8_t FULL_SKY_FF[2048];
+/* Pre-initialize light data at compile time to avoid race conditions */
+static uint8_t FULL_SKY_FF[2048];
+static int light_data_initialized = 0;
 
-    if (!sky_init) {
+void init_light_data_once(void) {
+    if (!light_data_initialized) {
         memset(FULL_SKY_FF, 0xFF, sizeof(FULL_SKY_FF));
-        sky_init = 1;
+        light_data_initialized = 1;
+        fprintf(stderr, "[INIT] Light data pre-initialized (thread-safe)\n");
+        fflush(stderr);
     }
+}
+
+static int write_light_data(dynbuf_t *b) {
+    /* Light data should be pre-initialized by main() before threading starts */
+    fprintf(stderr, "[LIGHT] write_light_data START (initialized=%d)\n", light_data_initialized);
+    fflush(stderr);
 
     /* Sky Light Mask: all 26 sections have sky light arrays */
-    if (!db_varint(b, 1)) return 0;
-    if (!db_be64(b, LIGHT_MASK)) return 0;
+    fprintf(stderr, "[LIGHT] Writing sky light mask\n");
+    fflush(stderr);
+    if (!db_varint(b, 1)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_varint(1) failed\n");
+        fflush(stderr);
+        return 0;
+    }
+    if (!db_be64(b, LIGHT_MASK)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_be64(LIGHT_MASK) failed\n");
+        fflush(stderr);
+        return 0;
+    }
 
     /* Block Light Mask: 0 (no block light arrays) */
-    if (!db_varint(b, 1)) return 0;
-    if (!db_be64(b, 0)) return 0;
+    fprintf(stderr, "[LIGHT] Writing block light mask\n");
+    fflush(stderr);
+    if (!db_varint(b, 1)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_varint(1) failed (block)\n");
+        fflush(stderr);
+        return 0;
+    }
+    if (!db_be64(b, 0)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_be64(0) failed\n");
+        fflush(stderr);
+        return 0;
+    }
 
     /* Empty Sky Light Mask: 0 (we provide data for all sections) */
-    if (!db_varint(b, 1)) return 0;
-    if (!db_be64(b, 0)) return 0;
+    fprintf(stderr, "[LIGHT] Writing empty sky light mask\n");
+    fflush(stderr);
+    if (!db_varint(b, 1)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_varint(1) failed (empty sky)\n");
+        fflush(stderr);
+        return 0;
+    }
+    if (!db_be64(b, 0)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_be64(0) failed (empty sky)\n");
+        fflush(stderr);
+        return 0;
+    }
 
     /* Empty Block Light Mask: all sections are empty block-light */
-    if (!db_varint(b, 1)) return 0;
-    if (!db_be64(b, LIGHT_MASK)) return 0;
+    fprintf(stderr, "[LIGHT] Writing empty block light mask\n");
+    fflush(stderr);
+    if (!db_varint(b, 1)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_varint(1) failed (empty block)\n");
+        fflush(stderr);
+        return 0;
+    }
+    if (!db_be64(b, LIGHT_MASK)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_be64(LIGHT_MASK) failed (empty block)\n");
+        fflush(stderr);
+        return 0;
+    }
 
     /* Sky Light Arrays: 26 x 2048 bytes of 0xFF */
-    if (!db_varint(b, LIGHT_SECTIONS)) return 0;
+    fprintf(stderr, "[LIGHT] Writing %d sky light arrays\n", LIGHT_SECTIONS);
+    fflush(stderr);
+    if (!db_varint(b, LIGHT_SECTIONS)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_varint(LIGHT_SECTIONS=%d) failed\n", LIGHT_SECTIONS);
+        fflush(stderr);
+        return 0;
+    }
     for (int i = 0; i < LIGHT_SECTIONS; i++) {
-        if (!db_varint(b, 2048)) return 0;
-        if (!db_bytes(b, FULL_SKY_FF, 2048)) return 0;
+        fprintf(stderr, "[LIGHT] Writing sky array %d\n", i);
+        fflush(stderr);
+        if (!db_varint(b, 2048)) {
+            fprintf(stderr, "[LIGHT] ERROR: db_varint(2048) failed at array %d\n", i);
+            fflush(stderr);
+            return 0;
+        }
+        if (!db_bytes(b, FULL_SKY_FF, 2048)) {
+            fprintf(stderr, "[LIGHT] ERROR: db_bytes(2048) failed at array %d\n", i);
+            fflush(stderr);
+            return 0;
+        }
     }
 
     /* Block Light Arrays: 0 entries */
-    if (!db_varint(b, 0)) return 0;
+    fprintf(stderr, "[LIGHT] Writing 0 block light arrays\n");
+    fflush(stderr);
+    if (!db_varint(b, 0)) {
+        fprintf(stderr, "[LIGHT] ERROR: db_varint(0) failed (block arrays)\n");
+        fflush(stderr);
+        return 0;
+    }
 
+    fprintf(stderr, "[LIGHT] write_light_data SUCCESS\n");
+    fflush(stderr);
     return 1;
 }
 
@@ -671,8 +744,10 @@ uint8_t *build_chunk_data_packet(const uint8_t *nbt, size_t nbt_len,
      * Phase 1: Parse the NBT to extract sections and heightmaps.
      * ---------------------------------------------------------------- */
 
-    chunk_section_t sections[NUM_SECTIONS];
-    memset(sections, 0, sizeof(sections));
+    chunk_section_t *sections = (chunk_section_t *)malloc(NUM_SECTIONS * sizeof(chunk_section_t));
+    if (!sections) return NULL;
+    
+    memset(sections, 0, NUM_SECTIONS * sizeof(chunk_section_t));
 
     hm_array_t hm_motion  = {NULL, 0};
     hm_array_t hm_surface = {NULL, 0};
@@ -860,9 +935,11 @@ build:;
     if (!write_light_data(&b)) goto fail;
 
     *out_len = b.len;
+    free(sections);
     return b.data;
 
 fail:
+    free(sections);
     free(b.data);
     return NULL;
 }
@@ -1095,12 +1172,19 @@ static int build_generated_section(section_bs_t *bs,
                                    int section_y) {
     int32_t palette_ids[8];
     uint8_t palette_indices[4096];
-    uint64_t longs[256];
+    uint64_t *longs = NULL;
     int palette_size = 0;
     int bits;
     uint32_t long_count;
     int y_base = (section_y + SECTION_Y_MIN) * 16;
     uint16_t non_air = 0;
+    
+    FILE *sec_log = fopen("section_generation.log", "a");
+    if (sec_log) {
+        fprintf(sec_log, "[SECTION_START] chunk (%d,%d) section %d\n", chunk_x, chunk_z, section_y);
+        fflush(sec_log);
+        fclose(sec_log);
+    }
     int32_t air_id = 0;
     int32_t stone_id = 1;
     int32_t grass_id = 9;
@@ -1108,7 +1192,7 @@ static int build_generated_section(section_bs_t *bs,
     int32_t water_id = 86;
     int32_t sand_id = 118;
     int32_t oak_log_id = 137;
-    int32_t oak_leaves_id = 278;
+    int32_t oak_leaves_id = 279;
     int32_t surface_y_cache[16 * 16];
 
     for (int lz = 0; lz < 16; ++lz) {
@@ -1121,7 +1205,7 @@ static int build_generated_section(section_bs_t *bs,
 
     memset(bs, 0, sizeof(*bs));
     memset(palette_indices, 0, sizeof(palette_indices));
-    memset(longs, 0, sizeof(longs));
+    /* Note: longs is NULL here, will be allocated later */
 
     for (int ly = 0; ly < 16; ++ly) {
         int32_t world_y = y_base + ly;
@@ -1165,6 +1249,12 @@ static int build_generated_section(section_bs_t *bs,
                 }
                 if (palette_index == palette_size) {
                     if (palette_size >= 8) {
+                        FILE *fail_log = fopen("section_generation.log", "a");
+                        if (fail_log) {
+                            fprintf(fail_log, "[SECTION_FAIL] chunk (%d,%d) section %d - palette overflow\n", chunk_x, chunk_z, section_y);
+                            fflush(fail_log);
+                            fclose(fail_log);
+                        }
                         return 0;
                     }
                     palette_ids[palette_size++] = block_id;
@@ -1201,74 +1291,259 @@ static int build_generated_section(section_bs_t *bs,
     {
         uint32_t values_per_long = (uint32_t)(64 / bits);
         long_count = (4096u + values_per_long - 1u) / values_per_long;
+        
+        /* Safety check: long_count should never exceed a reasonable size */
+        if (long_count > 1024) {
+            fprintf(stderr, "[ERROR] build_generated_section: long_count=%u exceeded max (bits=%d), chunk (%d,%d) section %d\n",
+                    long_count, bits, chunk_x, chunk_z, section_y);
+            FILE *fail_log = fopen("section_generation.log", "a");
+            if (fail_log) {
+                fprintf(fail_log, "[SECTION_FAIL] chunk (%d,%d) section %d - long_count %u exceeded 1024\n", chunk_x, chunk_z, section_y, long_count);
+                fflush(fail_log);
+                fclose(fail_log);
+            }
+            return 0;
+        }
     }
+    
+    /* Allocate longs array with proper size */
+    longs = (uint64_t *)malloc(long_count * sizeof(uint64_t));
+    if (!longs) {
+        FILE *fail_log = fopen("section_generation.log", "a");
+        if (fail_log) {
+            fprintf(fail_log, "[SECTION_FAIL] chunk (%d,%d) section %d - malloc longs failed\n", chunk_x, chunk_z, section_y);
+            fflush(fail_log);
+            fclose(fail_log);
+        }
+        return 0;
+    }
+    memset(longs, 0, long_count * sizeof(uint64_t));
+
     for (int i = 0; i < 4096; ++i) {
         uint32_t values_per_long = (uint32_t)(64 / bits);
         uint32_t long_index = (uint32_t)i / values_per_long;
         uint32_t start_bit = ((uint32_t)i % values_per_long) * (uint32_t)bits;
         uint64_t value = (uint64_t)palette_indices[i];
+        
+        /* Ensure value fits in the allocated bits */
+        uint64_t mask = (1ULL << bits) - 1;
+        value &= mask;
+
+        if (start_bit + bits > 64) {
+            fprintf(stderr, "[ERROR] build_generated_section: bit shift overflow at i=%d, start_bit=%u, bits=%d\n", 
+                    i, start_bit, bits);
+            free(longs);
+            return 0;
+        }
 
         longs[long_index] |= value << start_bit;
     }
 
     for (uint32_t i = 0; i < long_count; ++i) {
+        if (!longs || i >= long_count) {
+            fprintf(stderr, "[ERROR] build_generated_section: long_count overflow or null longs\n");
+            free(longs);
+            return 0;
+        }
+        /* Safety check: make sure we don't write beyond packed_out buffer (256 longs max = 2048 bytes) */
+        if (i >= 256) {
+            fprintf(stderr, "[ERROR] build_generated_section: writing beyond packed_out buffer (i=%u)\n", i);
+            free(longs);
+            return 0;
+        }
         write_u64_be_ptr(packed_out + (size_t)i * 8u, longs[i]);
     }
 
     bs->data_ptr = packed_out;
     bs->data_count = long_count;
+    free(longs);
+    
+    FILE *sec_end = fopen("section_generation.log", "a");
+    if (sec_end) {
+        fprintf(sec_end, "[SECTION_OK] chunk (%d,%d) section %d - success\n", chunk_x, chunk_z, section_y);
+        fflush(sec_end);
+        fclose(sec_end);
+    }
     return 1;
 }
 
 uint8_t *build_generated_overworld_chunk_packet(int32_t chunk_x, int32_t chunk_z,
                                                 size_t *out_len) {
     dynbuf_t b;
-    chunk_section_t sections[NUM_SECTIONS];
-    uint8_t packed_data[NUM_SECTIONS][256 * 8];
-    uint16_t non_air_counts[NUM_SECTIONS];
+    chunk_section_t *sections = NULL;
+    uint8_t **packed_data = NULL;
+    uint16_t *non_air_counts = NULL;
+    int i;
 
-    memset(&b, 0, sizeof(b));
-    memset(sections, 0, sizeof(sections));
-    memset(packed_data, 0, sizeof(packed_data));
-    memset(non_air_counts, 0, sizeof(non_air_counts));
+    fprintf(stderr, "[DEBUG] build_generated_overworld_chunk_packet START: chunk (%d,%d)\n", chunk_x, chunk_z);
+    fflush(stderr);
+    
+    /* Also log to file for crash debugging */
+    FILE *debug_log = fopen("chunk_debug.log", "a");
+    if (debug_log) {
+        fprintf(debug_log, "[DEBUG] build_generated_overworld_chunk_packet START: chunk (%d,%d)\n", chunk_x, chunk_z);
+        fflush(debug_log);
+        fclose(debug_log);
+    }
 
     if (!out_len) {
+        fprintf(stderr, "[ERROR] build_generated_overworld_chunk_packet: out_len is NULL\n");
         return NULL;
     }
 
+    /* Allocate large buffers on heap instead of stack to avoid stack overflow */
+    fprintf(stderr, "[DEBUG] Allocating sections: %zu bytes\n", NUM_SECTIONS * sizeof(chunk_section_t));
+    fflush(stderr);
+    sections = (chunk_section_t *)malloc(NUM_SECTIONS * sizeof(chunk_section_t));
+    if (!sections) {
+        fprintf(stderr, "[ERROR] Failed to malloc sections: %zu bytes\n", NUM_SECTIONS * sizeof(chunk_section_t));
+        fflush(stderr);
+        goto fail;
+    }
+
+    fprintf(stderr, "[DEBUG] Allocating packed_data array: %zu bytes\n", NUM_SECTIONS * sizeof(uint8_t *));
+    fflush(stderr);
+    packed_data = (uint8_t **)malloc(NUM_SECTIONS * sizeof(uint8_t *));
+    if (!packed_data) {
+        fprintf(stderr, "[ERROR] Failed to malloc packed_data\n");
+        fflush(stderr);
+        free(sections);
+        goto fail;
+    }
+
+    fprintf(stderr, "[DEBUG] Allocating packed_data buffers (%d x 2048 bytes)\n", NUM_SECTIONS);
+    fflush(stderr);
+    for (i = 0; i < NUM_SECTIONS; ++i) {
+        packed_data[i] = (uint8_t *)malloc(256 * 8);
+        if (!packed_data[i]) {
+            fprintf(stderr, "[ERROR] Failed to malloc packed_data[%d]\n", i);
+            fflush(stderr);
+            for (int j = 0; j < i; ++j) {
+                free(packed_data[j]);
+            }
+            free(packed_data);
+            free(sections);
+            goto fail;
+        }
+    }
+
+    fprintf(stderr, "[DEBUG] Allocating non_air_counts: %zu bytes\n", NUM_SECTIONS * sizeof(uint16_t));
+    fflush(stderr);
+    non_air_counts = (uint16_t *)malloc(NUM_SECTIONS * sizeof(uint16_t));
+    if (!non_air_counts) {
+        fprintf(stderr, "[ERROR] Failed to malloc non_air_counts\n");
+        fflush(stderr);
+        for (i = 0; i < NUM_SECTIONS; ++i) {
+            free(packed_data[i]);
+        }
+        free(packed_data);
+        free(sections);
+        goto fail;
+    }
+
+    memset(&b, 0, sizeof(b));
+    memset(sections, 0, NUM_SECTIONS * sizeof(chunk_section_t));
+    for (i = 0; i < NUM_SECTIONS; ++i) {
+        memset(packed_data[i], 0, 256 * 8);
+    }
+    memset(non_air_counts, 0, NUM_SECTIONS * sizeof(uint16_t));
+
     for (int i = 0; i < NUM_SECTIONS; ++i) {
         sections[i].valid = 1;
+        fprintf(stderr, "[DEBUG] build_generated_overworld_chunk_packet: generating section %d for chunk (%d,%d)\n", i, chunk_x, chunk_z);
+        fflush(stderr);
+        
+        FILE *debug_log = fopen("chunk_debug.log", "a");
+        if (debug_log) {
+            fprintf(debug_log, "[DEBUG] Section %d for chunk (%d,%d) - generating...\n", i, chunk_x, chunk_z);
+            fflush(debug_log);
+            fclose(debug_log);
+        }
+        
         if (!build_generated_section(&sections[i].bs,
                                      &non_air_counts[i],
                                      packed_data[i],
                                      chunk_x,
                                      chunk_z,
                                      i)) {
+            fprintf(stderr, "[ERROR] build_generated_section failed for chunk (%d,%d) section %d\n", chunk_x, chunk_z, i);
+            
+            FILE *err_log = fopen("chunk_debug.log", "a");
+            if (err_log) {
+                fprintf(err_log, "[ERROR] build_generated_section FAILED for chunk (%d,%d) section %d\n", chunk_x, chunk_z, i);
+                fflush(err_log);
+                fclose(err_log);
+            }
             goto fail;
+        }
+        
+        FILE *success_log = fopen("chunk_debug.log", "a");
+        if (success_log) {
+            fprintf(success_log, "[OK] Section %d for chunk (%d,%d) - generated\n", i, chunk_x, chunk_z);
+            fflush(success_log);
+            fclose(success_log);
         }
     }
 
-    if (!db_varint(&b, 0x2C)) goto fail;
-    if (!db_be32(&b, (uint32_t)chunk_x)) goto fail;
-    if (!db_be32(&b, (uint32_t)chunk_z)) goto fail;
+    if (!db_varint(&b, 0x2C)) {
+        fprintf(stderr, "[ERROR] Failed to write packet ID\n");
+        fflush(stderr);
+        goto fail;
+    }
+    if (!db_be32(&b, (uint32_t)chunk_x)) {
+        fprintf(stderr, "[ERROR] Failed to write chunk_x\n");
+        fflush(stderr);
+        goto fail;
+    }
+    if (!db_be32(&b, (uint32_t)chunk_z)) {
+        fprintf(stderr, "[ERROR] Failed to write chunk_z\n");
+        fflush(stderr);
+        goto fail;
+    }
 
+    fprintf(stderr, "[DEBUG] Writing heightmaps for chunk (%d,%d)\n", chunk_x, chunk_z);
+    fflush(stderr);
     {
         static uint8_t hm_zero[37 * 8] = {0};
         hm_array_t hm_safe = {hm_zero, 37};
-        if (!write_heightmaps(&b, &hm_safe, &hm_safe)) goto fail;
+        if (!write_heightmaps(&b, &hm_safe, &hm_safe)) {
+            fprintf(stderr, "[ERROR] Failed to write_heightmaps\n");
+            fflush(stderr);
+            goto fail;
+        }
     }
 
     {
         size_t data_len_pos = b.len;
         size_t data_start;
-        if (!dynbuf_grow(&b, 5)) goto fail;
+        fprintf(stderr, "[DEBUG] Growing dynbuf for data length varint\n");
+        fflush(stderr);
+        if (!dynbuf_grow(&b, 5)) {
+            fprintf(stderr, "[ERROR] Failed to grow dynbuf\n");
+            fflush(stderr);
+            goto fail;
+        }
         b.len += 5;
         data_start = b.len;
 
+        fprintf(stderr, "[DEBUG] Writing %d sections to dynbuf\n", NUM_SECTIONS);
+        fflush(stderr);
         for (int i = 0; i < NUM_SECTIONS; ++i) {
-            if (!db_be16(&b, non_air_counts[i])) goto fail;
-            if (!write_bs_container(&b, &sections[i].bs)) goto fail;
-            if (!write_biome_container(&b)) goto fail;
+            if (!db_be16(&b, non_air_counts[i])) {
+                fprintf(stderr, "[ERROR] Failed to write non_air_count[%d]\n", i);
+                fflush(stderr);
+                goto fail;
+            }
+            if (!write_bs_container(&b, &sections[i].bs)) {
+                fprintf(stderr, "[ERROR] Failed to write_bs_container for section %d\n", i);
+                fflush(stderr);
+                goto fail;
+            }
+            if (!write_biome_container(&b)) {
+                fprintf(stderr, "[ERROR] Failed to write_biome_container for section %d\n", i);
+                fflush(stderr);
+                goto fail;
+            }
         }
 
         {
@@ -1276,7 +1551,17 @@ uint8_t *build_generated_overworld_chunk_packet(int32_t chunk_x, int32_t chunk_z
             uint8_t vi[5];
             size_t vi_len = write_varint(vi, (int32_t)data_bytes);
             size_t shift = 5 - vi_len;
+            fprintf(stderr, "[DEBUG] Data bytes: %zu, varint_len: %zu, shift: %zu\n", data_bytes, vi_len, shift);
+            fflush(stderr);
             if (shift > 0) {
+                if (!b.data) {
+                    fprintf(stderr, "[ERROR] b.data is NULL before memmove\n");
+                    fflush(stderr);
+                    goto fail;
+                }
+                fprintf(stderr, "[DEBUG] Performing memmove: src=%p, dst=%p, size=%zu\n", 
+                        b.data + data_start, b.data + data_len_pos + vi_len, data_bytes);
+                fflush(stderr);
                 memmove(b.data + data_len_pos + vi_len,
                         b.data + data_start,
                         data_bytes);
@@ -1286,13 +1571,65 @@ uint8_t *build_generated_overworld_chunk_packet(int32_t chunk_x, int32_t chunk_z
         }
     }
 
-    if (!db_varint(&b, 0)) goto fail;
-    if (!write_light_data(&b)) goto fail;
+    fprintf(stderr, "[DEBUG] Writing biome count\n");
+    fflush(stderr);
+    if (!db_varint(&b, 0)) {
+        fprintf(stderr, "[ERROR] Failed to write biome count\n");
+        fflush(stderr);
+        goto fail;
+    }
+    
+    fprintf(stderr, "[DEBUG] Writing light data\n");
+    fflush(stderr);
+    if (!write_light_data(&b)) {
+        fprintf(stderr, "[ERROR] Failed to write_light_data\n");
+        fflush(stderr);
+        goto fail;
+    }
 
     *out_len = b.len;
+    /* Free heap allocations before returning success */
+    fprintf(stderr, "[DEBUG] build_generated_overworld_chunk_packet SUCCESS: chunk (%d,%d), packet_len=%zu\n", chunk_x, chunk_z, b.len);
+    fflush(stderr);
+    
+    FILE *success_log = fopen("chunk_debug.log", "a");
+    if (success_log) {
+        fprintf(success_log, "[SUCCESS] Chunk (%d,%d) generated successfully, size=%zu\n", chunk_x, chunk_z, b.len);
+        fflush(success_log);
+        fclose(success_log);
+    }
+    for (int j = 0; j < NUM_SECTIONS; ++j) {
+        free(packed_data[j]);
+    }
+    free(packed_data);
+    free(sections);
+    free(non_air_counts);
     return b.data;
 
 fail:
+    fprintf(stderr, "[ERROR] build_generated_overworld_chunk_packet FAILED: chunk (%d,%d)\n", chunk_x, chunk_z);
+    fflush(stderr);
+    
+    FILE *fail_log = fopen("chunk_debug.log", "a");
+    if (fail_log) {
+        fprintf(fail_log, "[FAILED] Chunk (%d,%d) generation failed\n", chunk_x, chunk_z);
+        fflush(fail_log);
+        fclose(fail_log);
+    }
+    if (packed_data) {
+        for (int j = 0; j < NUM_SECTIONS; ++j) {
+            if (packed_data[j]) {
+                free(packed_data[j]);
+            }
+        }
+        free(packed_data);
+    }
+    if (sections) {
+        free(sections);
+    }
+    if (non_air_counts) {
+        free(non_air_counts);
+    }
     free(b.data);
     return NULL;
 }
