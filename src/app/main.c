@@ -23,6 +23,8 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <ws2tcpip.h>
+#include <direct.h>
+#include <sys/stat.h>
 #pragma comment(lib, "ws2_32.lib")
 typedef SOCKET socket_handle_t;
 #else
@@ -33,6 +35,7 @@ typedef SOCKET socket_handle_t;
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/stat.h>
 typedef int socket_handle_t;
 #endif
 
@@ -62,6 +65,7 @@ static int g_log_chunk_sends = 1;
 #define CHAT_RATE_BLOCK_BASE_SECONDS    10
 #define CHAT_RATE_BLOCK_MAX_SECONDS     120
 #define CHAT_RATE_STRIKE_DECAY_SECONDS  300
+#define GENERATED_PACKET_CACHE_VERSION  17
 
 static socket_handle_t g_play_chat_sockets[MAX_PLAY_CHAT_SOCKETS];
 static char g_play_chat_socket_usernames[MAX_PLAY_CHAT_SOCKETS][32];
@@ -182,6 +186,37 @@ typedef enum {
     CHUNK_SEND_RESULT_GENERATED = 2,
     CHUNK_SEND_RESULT_DEBUG = 3
 } chunk_send_result_t;
+
+static int resolve_generated_world_root(const server_config_t *server_config,
+                                        char *world_root,
+                                        size_t world_root_size);
+static int ensure_generated_world_region_chunk_stub(const char *world_root,
+                                                    int32_t chunk_x,
+                                                    int32_t chunk_z);
+static int load_cached_generated_chunk_packet(const server_config_t *server_config,
+                                              int32_t chunk_x,
+                                              int32_t chunk_z,
+                                              uint8_t **out_packet,
+                                              size_t *out_packet_len);
+static void save_cached_generated_chunk_packet(const server_config_t *server_config,
+                                               int32_t chunk_x,
+                                               int32_t chunk_z,
+                                               const uint8_t *packet,
+                                               size_t packet_len);
+static int build_generated_chunk_nbt_payload(int32_t chunk_x,
+                                             int32_t chunk_z,
+                                             uint8_t **out_nbt,
+                                             size_t *out_nbt_len);
+
+static const char *world_source_mode_name(int mode) {
+    switch (mode) {
+        case WORLD_SOURCE_MODE_AUTO: return "auto";
+        case WORLD_SOURCE_MODE_REAL: return "real";
+        case WORLD_SOURCE_MODE_GENERATED: return "generated";
+        case WORLD_SOURCE_MODE_DEBUG: return "debug";
+        default: return "unknown";
+    }
+}
 
 static int track_spawned_entity_id(client_session_t *session, int32_t entity_id, int32_t entity_type) {
     size_t i;
@@ -1443,13 +1478,63 @@ static int send_stream_chunk(client_session_t *session,
     }
 
     if (!sent_this && (world_source_mode == WORLD_SOURCE_MODE_AUTO || world_source_mode == WORLD_SOURCE_MODE_GENERATED)) {
+        uint8_t *cached_packet = NULL;
+        size_t cached_packet_len = 0;
+
+        if (load_cached_generated_chunk_packet(&session->server_config,
+                                               chunk_x,
+                                               chunk_z,
+                                               &cached_packet,
+                                               &cached_packet_len)) {
+            char world_root[1024];
+            send_large_post_compression_packet(session->socket_fd, cached_packet, cached_packet_len);
+            if (g_log_chunk_sends) {
+                printf("Sent CACHED generated chunk for (%d,%d), %zu bytes.\n", chunk_x, chunk_z, cached_packet_len);
+            }
+            if (resolve_generated_world_root(&session->server_config, world_root, sizeof(world_root))) {
+                (void)ensure_generated_world_region_chunk_stub(world_root, chunk_x, chunk_z);
+            }
+            free(cached_packet);
+            sent_this = 1;
+            if (out_result != NULL) {
+                *out_result = CHUNK_SEND_RESULT_GENERATED;
+            }
+        }
+    }
+
+    if (!sent_this && (world_source_mode == WORLD_SOURCE_MODE_AUTO || world_source_mode == WORLD_SOURCE_MODE_GENERATED)) {
         size_t gen_len = 0;
         uint8_t *gen_buf = build_generated_overworld_chunk_packet(chunk_x, chunk_z, &gen_len);
+        if (gen_buf == NULL) {
+            uint8_t *chunk_nbt = NULL;
+            size_t chunk_nbt_len = 0;
+            if (build_generated_chunk_nbt_payload(chunk_x, chunk_z, &chunk_nbt, &chunk_nbt_len)) {
+                gen_buf = build_chunk_data_packet(chunk_nbt,
+                                                  chunk_nbt_len,
+                                                  chunk_x,
+                                                  chunk_z,
+                                                  &gen_len);
+                free(chunk_nbt);
+            }
+        }
+        if (gen_buf == NULL) {
+            gen_buf = build_generated_overworld_chunk_packet(chunk_x, chunk_z, &gen_len);
+            if (gen_buf != NULL) {
+                printf("WARNING: canonical generated chunk serialization failed for (%d,%d); using direct generator fallback.\n",
+                       chunk_x,
+                       chunk_z);
+            }
+        }
         if (gen_buf) {
             send_large_post_compression_packet(session->socket_fd, gen_buf, gen_len);
             if (g_log_chunk_sends) {
                 printf("Sent GENERATED chunk for (%d,%d), %zu bytes.\n", chunk_x, chunk_z, gen_len);
             }
+            save_cached_generated_chunk_packet(&session->server_config,
+                                               chunk_x,
+                                               chunk_z,
+                                               gen_buf,
+                                               gen_len);
             free(gen_buf);
             sent_this = 1;
             if (out_result != NULL) {
@@ -1512,6 +1597,20 @@ static int resolve_chunk_stream_radius(const server_config_t *server_config) {
     }
 }
 
+static int resolve_chunk_stream_radius_for_world_source(const server_config_t *server_config,
+                                                        int resolved_world_source_mode) {
+    int radius = resolve_chunk_stream_radius(server_config);
+
+    if (resolved_world_source_mode == WORLD_SOURCE_MODE_GENERATED && radius > 2) {
+        radius = 2;
+    }
+    if (resolved_world_source_mode == WORLD_SOURCE_MODE_DEBUG && radius > 3) {
+        radius = 3;
+    }
+
+    return radius;
+}
+
 static int env_flag_enabled(const char *name) {
     const char *value = getenv(name);
     if (value == NULL || value[0] == '\0') {
@@ -1525,6 +1624,1319 @@ static int env_flag_enabled(const char *name) {
     }
 
     return 0;
+}
+
+static void path_dirname_inplace(char *path) {
+    size_t len;
+
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+
+    len = strlen(path);
+    while (len > 0) {
+        char ch = path[len - 1];
+        if (ch == '/' || ch == '\\') {
+            path[len - 1] = '\0';
+            return;
+        }
+        len -= 1;
+    }
+
+    path[0] = '\0';
+}
+
+static int get_executable_dir_main(char *buffer, size_t buffer_size) {
+#ifdef _WIN32
+    DWORD length = GetModuleFileNameA(NULL, buffer, (DWORD)buffer_size);
+    if (length == 0 || length >= buffer_size) {
+        return 0;
+    }
+    path_dirname_inplace(buffer);
+    return buffer[0] != '\0';
+#else
+    ssize_t length = readlink("/proc/self/exe", buffer, buffer_size - 1);
+    if (length <= 0 || (size_t)length >= buffer_size) {
+        return 0;
+    }
+    buffer[length] = '\0';
+    path_dirname_inplace(buffer);
+    return buffer[0] != '\0';
+#endif
+}
+
+static int directory_exists_at(const char *path) {
+    struct stat st;
+
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    if (stat(path, &st) != 0) {
+        return 0;
+    }
+#ifdef _WIN32
+    return (st.st_mode & _S_IFDIR) != 0;
+#else
+    return S_ISDIR(st.st_mode);
+#endif
+}
+
+static int create_dir_if_missing(const char *path) {
+    if (directory_exists_at(path)) {
+        return 1;
+    }
+#ifdef _WIN32
+    return _mkdir(path) == 0;
+#else
+    return mkdir(path, 0755) == 0;
+#endif
+}
+
+static void write_be16_ptr(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)((v >> 8) & 0xFFu);
+    p[1] = (uint8_t)(v & 0xFFu);
+}
+
+static void write_be32_ptr(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)((v >> 24) & 0xFFu);
+    p[1] = (uint8_t)((v >> 16) & 0xFFu);
+    p[2] = (uint8_t)((v >> 8) & 0xFFu);
+    p[3] = (uint8_t)(v & 0xFFu);
+}
+
+static void write_be64_ptr(uint8_t *p, uint64_t v) {
+    p[0] = (uint8_t)((v >> 56) & 0xFFu);
+    p[1] = (uint8_t)((v >> 48) & 0xFFu);
+    p[2] = (uint8_t)((v >> 40) & 0xFFu);
+    p[3] = (uint8_t)((v >> 32) & 0xFFu);
+    p[4] = (uint8_t)((v >> 24) & 0xFFu);
+    p[5] = (uint8_t)((v >> 16) & 0xFFu);
+    p[6] = (uint8_t)((v >> 8) & 0xFFu);
+    p[7] = (uint8_t)(v & 0xFFu);
+}
+
+static int gzip_write_file(const char *path, const uint8_t *raw, size_t raw_len) {
+    z_stream stream;
+    uint8_t *compressed;
+    size_t compressed_cap;
+    size_t compressed_len;
+    FILE *fp;
+
+    if (path == NULL || raw == NULL || raw_len == 0) {
+        return 0;
+    }
+
+    compressed_cap = raw_len + (raw_len / 8u) + 128u;
+    compressed = (uint8_t *)malloc(compressed_cap);
+    if (compressed == NULL) {
+        return 0;
+    }
+
+    memset(&stream, 0, sizeof(stream));
+    stream.next_in = (Bytef *)raw;
+    stream.avail_in = (uInt)raw_len;
+    stream.next_out = compressed;
+    stream.avail_out = (uInt)compressed_cap;
+
+    if (deflateInit2(&stream,
+                     Z_DEFAULT_COMPRESSION,
+                     Z_DEFLATED,
+                     15 + 16,
+                     8,
+                     Z_DEFAULT_STRATEGY) != Z_OK) {
+        free(compressed);
+        return 0;
+    }
+
+    if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
+        deflateEnd(&stream);
+        free(compressed);
+        return 0;
+    }
+
+    compressed_len = (size_t)stream.total_out;
+    deflateEnd(&stream);
+
+    fp = fopen(path, "wb");
+    if (fp == NULL) {
+        free(compressed);
+        return 0;
+    }
+
+    if (fwrite(compressed, 1, compressed_len, fp) != compressed_len) {
+        fclose(fp);
+        free(compressed);
+        return 0;
+    }
+
+    fclose(fp);
+    free(compressed);
+    return 1;
+}
+
+static int zlib_compress_buffer(const uint8_t *raw,
+                                size_t raw_len,
+                                uint8_t **out_data,
+                                size_t *out_len) {
+    z_stream stream;
+    uint8_t *compressed;
+    size_t compressed_cap;
+
+    if (raw == NULL || raw_len == 0 || out_data == NULL || out_len == NULL) {
+        return 0;
+    }
+
+    *out_data = NULL;
+    *out_len = 0;
+    compressed_cap = raw_len + (raw_len / 8u) + 128u;
+    compressed = (uint8_t *)malloc(compressed_cap);
+    if (compressed == NULL) {
+        return 0;
+    }
+
+    memset(&stream, 0, sizeof(stream));
+    stream.next_in = (Bytef *)raw;
+    stream.avail_in = (uInt)raw_len;
+    stream.next_out = compressed;
+    stream.avail_out = (uInt)compressed_cap;
+
+    if (deflateInit(&stream, Z_DEFAULT_COMPRESSION) != Z_OK) {
+        free(compressed);
+        return 0;
+    }
+
+    if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
+        deflateEnd(&stream);
+        free(compressed);
+        return 0;
+    }
+
+    *out_len = (size_t)stream.total_out;
+    deflateEnd(&stream);
+    *out_data = compressed;
+    return 1;
+}
+
+typedef enum {
+    GEN_BLOCK_AIR = 0,
+    GEN_BLOCK_STONE = 1,
+    GEN_BLOCK_GRASS = 2,
+    GEN_BLOCK_DIRT = 3,
+    GEN_BLOCK_WATER = 4,
+    GEN_BLOCK_SAND = 5,
+    GEN_BLOCK_OAK_LOG = 6,
+    GEN_BLOCK_OAK_LEAVES = 7
+} gen_block_kind_t;
+
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} nbt_buf_t;
+
+static int nbt_buf_grow(nbt_buf_t *b, size_t extra) {
+    uint8_t *grown;
+    size_t next_cap;
+
+    if (b->len + extra <= b->cap) {
+        return 1;
+    }
+    next_cap = b->cap ? b->cap : 4096;
+    while (next_cap < b->len + extra) {
+        next_cap *= 2;
+    }
+    grown = (uint8_t *)realloc(b->data, next_cap);
+    if (grown == NULL) {
+        return 0;
+    }
+    b->data = grown;
+    b->cap = next_cap;
+    return 1;
+}
+
+static int nbt_buf_write(nbt_buf_t *b, const void *src, size_t n) {
+    if (!nbt_buf_grow(b, n)) {
+        return 0;
+    }
+    memcpy(b->data + b->len, src, n);
+    b->len += n;
+    return 1;
+}
+
+static int nbt_u8(nbt_buf_t *b, uint8_t v) {
+    return nbt_buf_write(b, &v, 1);
+}
+
+static int nbt_be16(nbt_buf_t *b, uint16_t v) {
+    uint8_t t[2];
+    write_be16_ptr(t, v);
+    return nbt_buf_write(b, t, sizeof(t));
+}
+
+static int nbt_be32(nbt_buf_t *b, uint32_t v) {
+    uint8_t t[4];
+    write_be32_ptr(t, v);
+    return nbt_buf_write(b, t, sizeof(t));
+}
+
+static int nbt_be64(nbt_buf_t *b, uint64_t v) {
+    uint8_t t[8];
+    write_be64_ptr(t, v);
+    return nbt_buf_write(b, t, sizeof(t));
+}
+
+static int nbt_name(nbt_buf_t *b, const char *name) {
+    size_t n = strlen(name);
+    if (n > 65535u) {
+        return 0;
+    }
+    return nbt_be16(b, (uint16_t)n) && nbt_buf_write(b, name, n);
+}
+
+static int nbt_tag_header(nbt_buf_t *b, uint8_t type, const char *name) {
+    return nbt_u8(b, type) && nbt_name(b, name);
+}
+
+static int nbt_tag_int(nbt_buf_t *b, const char *name, int32_t v) {
+    return nbt_tag_header(b, 3, name) && nbt_be32(b, (uint32_t)v);
+}
+
+static int nbt_tag_byte(nbt_buf_t *b, const char *name, int8_t v) {
+    return nbt_tag_header(b, 1, name) && nbt_u8(b, (uint8_t)v);
+}
+
+static int nbt_tag_string(nbt_buf_t *b, const char *name, const char *value) {
+    size_t n = strlen(value);
+    if (n > 65535u) {
+        return 0;
+    }
+    return nbt_tag_header(b, 8, name) && nbt_be16(b, (uint16_t)n) && nbt_buf_write(b, value, n);
+}
+
+static int nbt_tag_long_array(nbt_buf_t *b,
+                              const char *name,
+                              const uint64_t *arr,
+                              uint32_t count) {
+    if (!nbt_tag_header(b, 12, name) || !nbt_be32(b, count)) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!nbt_be64(b, arr[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static uint32_t generated_world_hash_persist(int32_t block_x, int32_t block_z) {
+    uint32_t x = (uint32_t)block_x;
+    uint32_t z = (uint32_t)block_z;
+    uint32_t hash = x * 374761393u;
+
+    hash += z * 668265263u;
+    hash = (hash ^ (hash >> 13)) * 1274126177u;
+    return hash ^ (hash >> 16);
+}
+
+static int generated_world_chunk_local_persist(int32_t value) {
+    int local = value % 16;
+    if (local < 0) {
+        local += 16;
+    }
+    return local;
+}
+
+static int generated_world_has_tree_persist(int32_t block_x, int32_t block_z, int32_t surface_y) {
+    int32_t slope_x;
+    int32_t slope_z;
+    int local_x = generated_world_chunk_local_persist(block_x);
+    int local_z = generated_world_chunk_local_persist(block_z);
+    int chance_mod = 64;
+    double moisture = sin((double)block_x * 0.0075) + cos((double)block_z * 0.0065);
+
+    if (surface_y <= 65 || surface_y >= 100) {
+        return 0;
+    }
+    if (local_x < 1 || local_x > 14 || local_z < 1 || local_z > 14) {
+        return 0;
+    }
+
+    slope_x = abs(surface_y - generated_world_surface_y(block_x + 1, block_z));
+    slope_x += abs(surface_y - generated_world_surface_y(block_x - 1, block_z));
+    slope_z = abs(surface_y - generated_world_surface_y(block_x, block_z + 1));
+    slope_z += abs(surface_y - generated_world_surface_y(block_x, block_z - 1));
+    if (slope_x + slope_z > 3) {
+        return 0;
+    }
+
+    if (moisture > 0.8) {
+        chance_mod = 34;
+    } else if (moisture > 0.2) {
+        chance_mod = 46;
+    } else if (moisture < -0.6) {
+        chance_mod = 92;
+    }
+    if (surface_y > 86) {
+        chance_mod += 24;
+    }
+
+    return (generated_world_hash_persist(block_x, block_z) % (uint32_t)chance_mod) == 0u;
+}
+
+static int generated_world_tree_height_persist(int32_t block_x, int32_t block_z) {
+    return 4 + (int)((generated_world_hash_persist(block_x, block_z) >> 8) % 3u);
+}
+
+static gen_block_kind_t generated_world_tree_block_persist(int32_t world_x,
+                                                           int32_t world_y,
+                                                           int32_t world_z) {
+    for (int dz = -2; dz <= 2; ++dz) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            int32_t trunk_x = world_x - dx;
+            int32_t trunk_z = world_z - dz;
+            int32_t trunk_surface_y = generated_world_surface_y(trunk_x, trunk_z);
+            int trunk_height;
+            int crown_base_y;
+            int leaf_radius;
+            int leaf_dx;
+            int leaf_dz;
+            int leaf_dy;
+
+            if (!generated_world_has_tree_persist(trunk_x, trunk_z, trunk_surface_y)) {
+                continue;
+            }
+
+            trunk_height = generated_world_tree_height_persist(trunk_x, trunk_z);
+            if (world_x == trunk_x && world_z == trunk_z &&
+                world_y > trunk_surface_y && world_y <= trunk_surface_y + trunk_height) {
+                return GEN_BLOCK_OAK_LOG;
+            }
+
+            crown_base_y = trunk_surface_y + trunk_height - 2;
+            leaf_dy = (int)(world_y - crown_base_y);
+            if (leaf_dy < 0 || leaf_dy > 3) {
+                continue;
+            }
+
+            leaf_radius = (leaf_dy == 3) ? 1 : 2;
+            leaf_dx = abs(dx);
+            leaf_dz = abs(dz);
+            if (leaf_dx > leaf_radius || leaf_dz > leaf_radius) {
+                continue;
+            }
+            if (leaf_dy == 3 && leaf_dx + leaf_dz > 1) {
+                continue;
+            }
+            if (leaf_dy == 0 && leaf_dx == 2 && leaf_dz == 2) {
+                continue;
+            }
+            if (world_x == trunk_x && world_z == trunk_z &&
+                world_y <= trunk_surface_y + trunk_height) {
+                continue;
+            }
+
+            return GEN_BLOCK_OAK_LEAVES;
+        }
+    }
+
+    return GEN_BLOCK_AIR;
+}
+
+static gen_block_kind_t generated_world_block_kind(int32_t world_x, int32_t world_y, int32_t world_z) {
+    int32_t surface_y = generated_world_surface_y(world_x, world_z);
+
+    if (world_y <= surface_y) {
+        if (world_y == surface_y) {
+            return (surface_y <= 65) ? GEN_BLOCK_SAND : GEN_BLOCK_GRASS;
+        }
+        if (world_y >= surface_y - 3) {
+            return (surface_y <= 67) ? GEN_BLOCK_SAND : GEN_BLOCK_DIRT;
+        }
+        return GEN_BLOCK_STONE;
+    }
+
+    if (world_y <= 64) {
+        return GEN_BLOCK_WATER;
+    }
+
+    if (world_y <= surface_y + 8) {
+        return generated_world_tree_block_persist(world_x, world_y, world_z);
+    }
+
+    return GEN_BLOCK_AIR;
+}
+
+static const char *generated_world_block_name(gen_block_kind_t k) {
+    switch (k) {
+        case GEN_BLOCK_STONE: return "minecraft:stone";
+        case GEN_BLOCK_GRASS: return "minecraft:grass_block";
+        case GEN_BLOCK_DIRT: return "minecraft:dirt";
+        case GEN_BLOCK_WATER: return "minecraft:water";
+        case GEN_BLOCK_SAND: return "minecraft:sand";
+        case GEN_BLOCK_OAK_LOG: return "minecraft:oak_log";
+        case GEN_BLOCK_OAK_LEAVES: return "minecraft:oak_leaves";
+        case GEN_BLOCK_AIR:
+        default:
+            return "minecraft:air";
+    }
+}
+
+static int generated_palette_index(gen_block_kind_t *palette,
+                                   int *palette_size,
+                                   gen_block_kind_t kind) {
+    for (int i = 0; i < *palette_size; ++i) {
+        if (palette[i] == kind) {
+            return i;
+        }
+    }
+    if (*palette_size >= 16) {
+        return 0;
+    }
+    palette[*palette_size] = kind;
+    *palette_size += 1;
+    return *palette_size - 1;
+}
+
+static void pack_palette_indices_u64(const uint16_t *indices,
+                                     int entry_count,
+                                     int bits,
+                                     uint64_t *out_longs,
+                                     int long_count) {
+    memset(out_longs, 0, (size_t)long_count * sizeof(uint64_t));
+    for (int i = 0; i < entry_count; ++i) {
+        uint32_t bit_index = (uint32_t)i * (uint32_t)bits;
+        uint32_t long_index = bit_index >> 6;
+        uint32_t start_bit = bit_index & 63u;
+        uint64_t value = (uint64_t)indices[i];
+
+        if ((int)long_index >= long_count) {
+            break;
+        }
+        out_longs[long_index] |= value << start_bit;
+        if (start_bit + (uint32_t)bits > 64u && (int)(long_index + 1u) < long_count) {
+            out_longs[long_index + 1u] |= value >> (64u - start_bit);
+        }
+    }
+}
+
+static int build_generated_chunk_nbt_payload(int32_t chunk_x,
+                                             int32_t chunk_z,
+                                             uint8_t **out_nbt,
+                                             size_t *out_nbt_len) {
+    nbt_buf_t b = {0};
+    uint64_t hm_longs[37];
+    uint16_t hm_entries[256];
+    const int min_world_y = -64;
+
+    if (out_nbt == NULL || out_nbt_len == NULL) {
+        return 0;
+    }
+    *out_nbt = NULL;
+    *out_nbt_len = 0;
+
+    memset(hm_entries, 0, sizeof(hm_entries));
+    memset(hm_longs, 0, sizeof(hm_longs));
+
+    for (int lz = 0; lz < 16; ++lz) {
+        for (int lx = 0; lx < 16; ++lx) {
+            int32_t wx = chunk_x * 16 + lx;
+            int32_t wz = chunk_z * 16 + lz;
+            int top_y = min_world_y - 1;
+            for (int y = 319; y >= -64; --y) {
+                if (generated_world_block_kind(wx, y, wz) != GEN_BLOCK_AIR) {
+                    top_y = y;
+                    break;
+                }
+            }
+            {
+                int idx = lz * 16 + lx;
+                int hm_value = top_y + 1 - min_world_y;
+                if (hm_value < 0) hm_value = 0;
+                if (hm_value > 511) hm_value = 511;
+                hm_entries[idx] = (uint16_t)hm_value;
+            }
+        }
+    }
+
+    {
+        const int bits = 9;
+        const int entries_per_long = 64 / bits;
+        for (int i = 0; i < 256; ++i) {
+            int long_index = i / entries_per_long;
+            int bit_index = (i % entries_per_long) * bits;
+            hm_longs[long_index] |= ((uint64_t)hm_entries[i]) << bit_index;
+        }
+    }
+
+    if (!nbt_u8(&b, 10) || !nbt_be16(&b, 0)) goto fail; /* root compound */
+    if (!nbt_tag_int(&b, "DataVersion", 3953)) goto fail;
+    if (!nbt_tag_int(&b, "xPos", chunk_x)) goto fail;
+    if (!nbt_tag_int(&b, "zPos", chunk_z)) goto fail;
+    if (!nbt_tag_string(&b, "Status", "minecraft:full")) goto fail;
+
+    if (!nbt_tag_header(&b, 10, "Heightmaps")) goto fail;
+    if (!nbt_tag_long_array(&b, "WORLD_SURFACE", hm_longs, 37u)) goto fail;
+    if (!nbt_u8(&b, 0)) goto fail;
+
+    if (!nbt_tag_header(&b, 9, "sections") || !nbt_u8(&b, 10) || !nbt_be32(&b, 24u)) goto fail;
+    for (int sy = -4; sy <= 19; ++sy) {
+        gen_block_kind_t palette[16];
+        int palette_size = 0;
+        uint16_t indices[4096];
+        int y_base = sy * 16;
+
+        if (!nbt_u8(&b, 10)) goto fail; /* section compound */
+        if (!nbt_tag_byte(&b, "Y", (int8_t)sy)) goto fail;
+
+        for (int ly = 0; ly < 16; ++ly) {
+            int wy = y_base + ly;
+            for (int lz = 0; lz < 16; ++lz) {
+                int wz = chunk_z * 16 + lz;
+                for (int lx = 0; lx < 16; ++lx) {
+                    int wx = chunk_x * 16 + lx;
+                    gen_block_kind_t kind = generated_world_block_kind(wx, wy, wz);
+                    int index = (ly << 8) | (lz << 4) | lx;
+                    indices[index] = (uint16_t)generated_palette_index(palette, &palette_size, kind);
+                }
+            }
+        }
+
+        if (!nbt_tag_header(&b, 10, "block_states")) goto fail;
+        if (!nbt_tag_header(&b, 9, "palette") || !nbt_u8(&b, 10) || !nbt_be32(&b, (uint32_t)palette_size)) goto fail;
+        for (int i = 0; i < palette_size; ++i) {
+            if (!nbt_u8(&b, 10)) goto fail;
+            if (!nbt_tag_string(&b, "Name", generated_world_block_name(palette[i]))) goto fail;
+            if (!nbt_u8(&b, 0)) goto fail;
+        }
+
+        if (palette_size > 1) {
+            int bits = 0;
+            int long_count;
+            uint64_t longs[256];
+            int ps = palette_size - 1;
+            while (ps > 0) {
+                bits += 1;
+                ps >>= 1;
+            }
+            if (bits < 4) bits = 4;
+            long_count = (int)((4096 * bits + 63) / 64);
+            pack_palette_indices_u64(indices, 4096, bits, longs, long_count);
+            if (!nbt_tag_long_array(&b, "data", longs, (uint32_t)long_count)) goto fail;
+        }
+        if (!nbt_u8(&b, 0)) goto fail; /* end block_states */
+
+        if (!nbt_tag_header(&b, 10, "biomes")) goto fail;
+        if (!nbt_tag_header(&b, 9, "palette") || !nbt_u8(&b, 8) || !nbt_be32(&b, 1u)) goto fail;
+        if (!nbt_be16(&b, 16) || !nbt_buf_write(&b, "minecraft:plains", 16)) goto fail;
+        if (!nbt_u8(&b, 0)) goto fail; /* end biomes */
+
+        if (!nbt_u8(&b, 0)) goto fail; /* end section compound */
+    }
+
+    if (!nbt_tag_header(&b, 9, "block_entities") || !nbt_u8(&b, 10) || !nbt_be32(&b, 0u)) goto fail;
+    if (!nbt_u8(&b, 0)) goto fail; /* end root */
+
+    *out_nbt = b.data;
+    *out_nbt_len = b.len;
+    return 1;
+
+fail:
+    free(b.data);
+    return 0;
+}
+
+static int32_t floor_div32_local(int32_t value, int32_t divisor) {
+    int32_t q = value / divisor;
+    int32_t r = value % divisor;
+    if (r != 0 && ((r < 0) != (divisor < 0))) {
+        q -= 1;
+    }
+    return q;
+}
+
+static int count_generated_region_indexed_chunks(const char *world_root,
+                                                 int32_t region_x,
+                                                 int32_t region_z,
+                                                 int *out_indexed_count) {
+    char region_path[1200];
+    uint8_t locations[4096];
+    FILE *fp;
+    int indexed_count = 0;
+
+    if (world_root == NULL || world_root[0] == '\0' || out_indexed_count == NULL) {
+        return 0;
+    }
+
+#ifdef _WIN32
+    snprintf(region_path, sizeof(region_path), "%s\\region\\r.%d.%d.mca", world_root, region_x, region_z);
+#else
+    snprintf(region_path, sizeof(region_path), "%s/region/r.%d.%d.mca", world_root, region_x, region_z);
+#endif
+
+    fp = fopen(region_path, "rb");
+    if (fp == NULL) {
+        return 0;
+    }
+    if (fread(locations, 1, sizeof(locations), fp) != sizeof(locations)) {
+        fclose(fp);
+        return 0;
+    }
+    fclose(fp);
+
+    for (int i = 0; i < 1024; ++i) {
+        uint32_t location = ((uint32_t)locations[i * 4 + 0] << 24) |
+                            ((uint32_t)locations[i * 4 + 1] << 16) |
+                            ((uint32_t)locations[i * 4 + 2] << 8) |
+                            (uint32_t)locations[i * 4 + 3];
+        if (location != 0) {
+            indexed_count += 1;
+        }
+    }
+
+    *out_indexed_count = indexed_count;
+    return 1;
+}
+
+static void log_generated_region_index_summary(const server_config_t *server_config,
+                                               int32_t center_chunk_x,
+                                               int32_t center_chunk_z,
+                                               int radius) {
+    char world_root[1024];
+    int32_t min_chunk_x;
+    int32_t max_chunk_x;
+    int32_t min_chunk_z;
+    int32_t max_chunk_z;
+    int32_t min_region_x;
+    int32_t max_region_x;
+    int32_t min_region_z;
+    int32_t max_region_z;
+    int region_files = 0;
+
+    if (server_config == NULL || radius < 0) {
+        return;
+    }
+    if (!resolve_generated_world_root(server_config, world_root, sizeof(world_root))) {
+        return;
+    }
+
+    min_chunk_x = center_chunk_x - radius;
+    max_chunk_x = center_chunk_x + radius;
+    min_chunk_z = center_chunk_z - radius;
+    max_chunk_z = center_chunk_z + radius;
+
+    min_region_x = floor_div32_local(min_chunk_x, 32);
+    max_region_x = floor_div32_local(max_chunk_x, 32);
+    min_region_z = floor_div32_local(min_chunk_z, 32);
+    max_region_z = floor_div32_local(max_chunk_z, 32);
+
+    for (int32_t rz = min_region_z; rz <= max_region_z; ++rz) {
+        for (int32_t rx = min_region_x; rx <= max_region_x; ++rx) {
+            int indexed_count = 0;
+            if (count_generated_region_indexed_chunks(world_root, rx, rz, &indexed_count)) {
+                printf("Generated region r.%d.%d.mca indexed chunks: %d/1024.\n",
+                       rx,
+                       rz,
+                       indexed_count);
+                region_files += 1;
+            }
+        }
+    }
+
+    if (region_files == 0) {
+        printf("Generated region index summary: no region files found near (%d,%d) radius=%d.\n",
+               center_chunk_x,
+               center_chunk_z,
+               radius);
+    }
+}
+
+static int ensure_generated_world_region_chunk_stub(const char *world_root,
+                                                    int32_t chunk_x,
+                                                    int32_t chunk_z) {
+    char region_path[1200];
+    uint8_t *chunk_nbt = NULL;
+    size_t chunk_nbt_len = 0;
+    uint8_t *compressed_nbt = NULL;
+    size_t compressed_nbt_len = 0;
+    uint8_t header[8192];
+    uint8_t pad[4096];
+    size_t chunk_payload_len;
+    size_t chunk_total_len;
+    uint8_t sector_count;
+    FILE *fp;
+    uint32_t timestamp;
+    int32_t region_x;
+    int32_t region_z;
+    int32_t local_x;
+    int32_t local_z;
+    int entry_index;
+    uint32_t existing_loc;
+    long file_size;
+    uint32_t start_sector;
+
+    if (world_root == NULL || world_root[0] == '\0') {
+        return 0;
+    }
+
+    region_x = floor_div32_local(chunk_x, 32);
+    region_z = floor_div32_local(chunk_z, 32);
+    local_x = chunk_x - region_x * 32;
+    local_z = chunk_z - region_z * 32;
+    if (local_x < 0 || local_x > 31 || local_z < 0 || local_z > 31) {
+        return 0;
+    }
+    entry_index = local_x + local_z * 32;
+
+#ifdef _WIN32
+    snprintf(region_path, sizeof(region_path), "%s\\region\\r.%d.%d.mca", world_root, region_x, region_z);
+#else
+    snprintf(region_path, sizeof(region_path), "%s/region/r.%d.%d.mca", world_root, region_x, region_z);
+#endif
+
+    fp = fopen(region_path, "rb");
+    if (fp == NULL) {
+        memset(header, 0, sizeof(header));
+        fp = fopen(region_path, "wb");
+        if (fp == NULL) {
+            return 0;
+        }
+        (void)fwrite(header, 1, sizeof(header), fp);
+        fclose(fp);
+    } else {
+        fclose(fp);
+    }
+
+    fp = fopen(region_path, "rb+");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    if (fread(header, 1, sizeof(header), fp) != sizeof(header)) {
+        fclose(fp);
+        return 0;
+    }
+
+    existing_loc = ((uint32_t)header[entry_index * 4 + 0] << 24) |
+                   ((uint32_t)header[entry_index * 4 + 1] << 16) |
+                   ((uint32_t)header[entry_index * 4 + 2] << 8) |
+                   (uint32_t)header[entry_index * 4 + 3];
+    if (existing_loc != 0) {
+        fclose(fp);
+        return 1;
+    }
+
+    if (!build_generated_chunk_nbt_payload(chunk_x, chunk_z, &chunk_nbt, &chunk_nbt_len)) {
+        fclose(fp);
+        return 0;
+    }
+    if (!zlib_compress_buffer(chunk_nbt, chunk_nbt_len, &compressed_nbt, &compressed_nbt_len)) {
+        free(chunk_nbt);
+        fclose(fp);
+        return 0;
+    }
+    free(chunk_nbt);
+
+    chunk_payload_len = 1u + compressed_nbt_len;
+    chunk_total_len = 4u + chunk_payload_len;
+    sector_count = (uint8_t)((chunk_total_len + 4095u) / 4096u);
+    if (sector_count == 0 || sector_count > 255u) {
+        free(compressed_nbt);
+        fclose(fp);
+        return 0;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        free(compressed_nbt);
+        fclose(fp);
+        return 0;
+    }
+    file_size = ftell(fp);
+    if (file_size < 8192) {
+        file_size = 8192;
+    }
+    start_sector = (uint32_t)(((size_t)file_size + 4095u) / 4096u);
+    if (start_sector > 0xFFFFFFu) {
+        free(compressed_nbt);
+        fclose(fp);
+        return 0;
+    }
+
+    {
+        size_t aligned_offset = (size_t)start_sector * 4096u;
+        size_t cur = (size_t)file_size;
+        memset(pad, 0, sizeof(pad));
+        while (cur < aligned_offset) {
+            size_t nwrite = aligned_offset - cur;
+            if (nwrite > sizeof(pad)) {
+                nwrite = sizeof(pad);
+            }
+            (void)fwrite(pad, 1, nwrite, fp);
+            cur += nwrite;
+        }
+    }
+
+    {
+        uint8_t lenbuf[4];
+        write_be32_ptr(lenbuf, (uint32_t)chunk_payload_len);
+        (void)fwrite(lenbuf, 1, sizeof(lenbuf), fp);
+    }
+    {
+        uint8_t ctype = 2;
+        (void)fwrite(&ctype, 1, 1, fp);
+    }
+    (void)fwrite(compressed_nbt, 1, compressed_nbt_len, fp);
+
+    {
+        size_t pad_len = (size_t)sector_count * 4096u - chunk_total_len;
+        memset(pad, 0, sizeof(pad));
+        while (pad_len > 0) {
+            size_t nwrite = pad_len > sizeof(pad) ? sizeof(pad) : pad_len;
+            (void)fwrite(pad, 1, nwrite, fp);
+            pad_len -= nwrite;
+        }
+    }
+
+    header[entry_index * 4 + 0] = (uint8_t)((start_sector >> 16) & 0xFFu);
+    header[entry_index * 4 + 1] = (uint8_t)((start_sector >> 8) & 0xFFu);
+    header[entry_index * 4 + 2] = (uint8_t)(start_sector & 0xFFu);
+    header[entry_index * 4 + 3] = sector_count;
+
+    timestamp = (uint32_t)time(NULL);
+    write_be32_ptr(header + 4096 + entry_index * 4, timestamp);
+
+    if (fseek(fp, 0, SEEK_SET) == 0) {
+        (void)fwrite(header, 1, sizeof(header), fp);
+    }
+
+    fclose(fp);
+    free(compressed_nbt);
+    return 1;
+}
+
+static void ensure_generated_world_level_dat(const char *world_root) {
+    char level_dat_path[1200];
+    uint8_t nbt[256];
+    size_t n = 0;
+    int32_t spawn_x = 8;
+    int32_t spawn_z = 8;
+    int32_t spawn_y = generated_world_surface_y(spawn_x, spawn_z) + 2;
+
+    if (world_root == NULL || world_root[0] == '\0') {
+        return;
+    }
+
+#ifdef _WIN32
+    snprintf(level_dat_path, sizeof(level_dat_path), "%s\\level.dat", world_root);
+#else
+    snprintf(level_dat_path, sizeof(level_dat_path), "%s/level.dat", world_root);
+#endif
+
+    {
+        FILE *fp = fopen(level_dat_path, "rb");
+        if (fp != NULL) {
+            fclose(fp);
+            return;
+        }
+    }
+
+    /* Root compound with empty name. */
+    nbt[n++] = 10;
+    write_be16_ptr(nbt + n, 0); n += 2;
+
+    /* Data compound. */
+    nbt[n++] = 10;
+    write_be16_ptr(nbt + n, 4); n += 2;
+    memcpy(nbt + n, "Data", 4); n += 4;
+
+    /* SpawnX */
+    nbt[n++] = 3;
+    write_be16_ptr(nbt + n, 6); n += 2;
+    memcpy(nbt + n, "SpawnX", 6); n += 6;
+    write_be32_ptr(nbt + n, (uint32_t)spawn_x); n += 4;
+
+    /* SpawnY */
+    nbt[n++] = 3;
+    write_be16_ptr(nbt + n, 6); n += 2;
+    memcpy(nbt + n, "SpawnY", 6); n += 6;
+    write_be32_ptr(nbt + n, (uint32_t)spawn_y); n += 4;
+
+    /* SpawnZ */
+    nbt[n++] = 3;
+    write_be16_ptr(nbt + n, 6); n += 2;
+    memcpy(nbt + n, "SpawnZ", 6); n += 6;
+    write_be32_ptr(nbt + n, (uint32_t)spawn_z); n += 4;
+
+    /* SpawnAngle float=0.0 */
+    nbt[n++] = 5;
+    write_be16_ptr(nbt + n, 10); n += 2;
+    memcpy(nbt + n, "SpawnAngle", 10); n += 10;
+    write_be32_ptr(nbt + n, 0); n += 4;
+
+    /* End Data compound, end root compound. */
+    nbt[n++] = 0;
+    nbt[n++] = 0;
+
+    if (!gzip_write_file(level_dat_path, nbt, n)) {
+        printf("WARNING: failed to write generated level.dat at %s\n", level_dat_path);
+    } else {
+        printf("Created generated level.dat at %s\n", level_dat_path);
+    }
+}
+
+static void ensure_generated_world_session_lock(const char *world_root) {
+    char lock_path[1200];
+    uint8_t lock_bytes[8];
+    uint64_t now_ms;
+    FILE *fp;
+
+    if (world_root == NULL || world_root[0] == '\0') {
+        return;
+    }
+
+#ifdef _WIN32
+    snprintf(lock_path, sizeof(lock_path), "%s\\session.lock", world_root);
+#else
+    snprintf(lock_path, sizeof(lock_path), "%s/session.lock", world_root);
+#endif
+
+    now_ms = (uint64_t)time(NULL) * 1000ull;
+    write_be64_ptr(lock_bytes, now_ms);
+
+    fp = fopen(lock_path, "wb");
+    if (fp == NULL) {
+        printf("WARNING: failed to write generated session.lock at %s\n", lock_path);
+        return;
+    }
+
+    (void)fwrite(lock_bytes, 1, sizeof(lock_bytes), fp);
+    fclose(fp);
+}
+
+static int resolve_generated_world_root(const server_config_t *server_config,
+                                        char *world_root,
+                                        size_t world_root_size) {
+    char exe_dir[1024];
+
+    if (server_config == NULL || world_root == NULL || world_root_size == 0) {
+        return 0;
+    }
+
+    if (server_config->world_path[0] != '\0') {
+        snprintf(world_root, world_root_size, "%s", server_config->world_path);
+        return 1;
+    }
+
+    if (!get_executable_dir_main(exe_dir, sizeof(exe_dir))) {
+        return 0;
+    }
+#ifdef _WIN32
+    snprintf(world_root, world_root_size, "%s\\world", exe_dir);
+#else
+    snprintf(world_root, world_root_size, "%s/world", exe_dir);
+#endif
+    return 1;
+}
+
+static int load_cached_generated_chunk_packet(const server_config_t *server_config,
+                                              int32_t chunk_x,
+                                              int32_t chunk_z,
+                                              uint8_t **out_packet,
+                                              size_t *out_packet_len) {
+    char world_root[1024];
+    char cache_path[1200];
+    FILE *fp;
+    uint8_t header[20];
+    uint32_t payload_len;
+    int32_t stored_x;
+    int32_t stored_z;
+    uint8_t *payload;
+
+    if (out_packet == NULL || out_packet_len == NULL) {
+        return 0;
+    }
+    *out_packet = NULL;
+    *out_packet_len = 0;
+
+    if (!resolve_generated_world_root(server_config, world_root, sizeof(world_root))) {
+        return 0;
+    }
+
+#ifdef _WIN32
+    snprintf(cache_path, sizeof(cache_path), "%s\\generated_packets\\c.%d.%d.bin", world_root, chunk_x, chunk_z);
+#else
+    snprintf(cache_path, sizeof(cache_path), "%s/generated_packets/c.%d.%d.bin", world_root, chunk_x, chunk_z);
+#endif
+
+    fp = fopen(cache_path, "rb");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    if (fread(header, 1, sizeof(header), fp) != sizeof(header)) {
+        fclose(fp);
+        return 0;
+    }
+
+    if (!(header[0] == 'V' && header[1] == 'G' && header[2] == 'C' && header[3] == 'P')) {
+        fclose(fp);
+        return 0;
+    }
+    if (!(header[4] == 0 &&
+          header[5] == 0 &&
+          header[6] == 0 &&
+          header[7] == (uint8_t)GENERATED_PACKET_CACHE_VERSION)) {
+        fclose(fp);
+        return 0;
+    }
+
+    stored_x = (int32_t)(((uint32_t)header[8] << 24) |
+                         ((uint32_t)header[9] << 16) |
+                         ((uint32_t)header[10] << 8) |
+                         (uint32_t)header[11]);
+    stored_z = (int32_t)(((uint32_t)header[12] << 24) |
+                         ((uint32_t)header[13] << 16) |
+                         ((uint32_t)header[14] << 8) |
+                         (uint32_t)header[15]);
+    payload_len = ((uint32_t)header[16] << 24) |
+                  ((uint32_t)header[17] << 16) |
+                  ((uint32_t)header[18] << 8) |
+                  (uint32_t)header[19];
+
+    if (stored_x != chunk_x || stored_z != chunk_z || payload_len == 0 || payload_len > (8u * 1024u * 1024u)) {
+        fclose(fp);
+        return 0;
+    }
+
+    payload = (uint8_t *)malloc((size_t)payload_len);
+    if (payload == NULL) {
+        fclose(fp);
+        return 0;
+    }
+
+    if (fread(payload, 1, (size_t)payload_len, fp) != (size_t)payload_len) {
+        free(payload);
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    *out_packet = payload;
+    *out_packet_len = (size_t)payload_len;
+    return 1;
+}
+
+static void save_cached_generated_chunk_packet(const server_config_t *server_config,
+                                               int32_t chunk_x,
+                                               int32_t chunk_z,
+                                               const uint8_t *packet,
+                                               size_t packet_len) {
+    char world_root[1024];
+    char cache_dir[1100];
+    char cache_path[1200];
+    FILE *fp;
+    uint8_t header[20];
+
+    if (packet == NULL || packet_len == 0 || packet_len > (8u * 1024u * 1024u)) {
+        return;
+    }
+    if (!resolve_generated_world_root(server_config, world_root, sizeof(world_root))) {
+        return;
+    }
+
+#ifdef _WIN32
+    snprintf(cache_dir, sizeof(cache_dir), "%s\\generated_packets", world_root);
+    snprintf(cache_path, sizeof(cache_path), "%s\\c.%d.%d.bin", cache_dir, chunk_x, chunk_z);
+#else
+    snprintf(cache_dir, sizeof(cache_dir), "%s/generated_packets", world_root);
+    snprintf(cache_path, sizeof(cache_path), "%s/c.%d.%d.bin", cache_dir, chunk_x, chunk_z);
+#endif
+
+    if (!create_dir_if_missing(cache_dir)) {
+        return;
+    }
+
+    header[0] = 'V'; header[1] = 'G'; header[2] = 'C'; header[3] = 'P';
+    header[4] = 0;
+    header[5] = 0;
+    header[6] = 0;
+    header[7] = (uint8_t)GENERATED_PACKET_CACHE_VERSION;
+    header[8] = (uint8_t)(((uint32_t)chunk_x >> 24) & 0xFF);
+    header[9] = (uint8_t)(((uint32_t)chunk_x >> 16) & 0xFF);
+    header[10] = (uint8_t)(((uint32_t)chunk_x >> 8) & 0xFF);
+    header[11] = (uint8_t)((uint32_t)chunk_x & 0xFF);
+    header[12] = (uint8_t)(((uint32_t)chunk_z >> 24) & 0xFF);
+    header[13] = (uint8_t)(((uint32_t)chunk_z >> 16) & 0xFF);
+    header[14] = (uint8_t)(((uint32_t)chunk_z >> 8) & 0xFF);
+    header[15] = (uint8_t)((uint32_t)chunk_z & 0xFF);
+    header[16] = (uint8_t)(((uint32_t)packet_len >> 24) & 0xFF);
+    header[17] = (uint8_t)(((uint32_t)packet_len >> 16) & 0xFF);
+    header[18] = (uint8_t)(((uint32_t)packet_len >> 8) & 0xFF);
+    header[19] = (uint8_t)((uint32_t)packet_len & 0xFF);
+
+    fp = fopen(cache_path, "wb");
+    if (fp == NULL) {
+        return;
+    }
+
+    if (fwrite(header, 1, sizeof(header), fp) != sizeof(header) ||
+        fwrite(packet, 1, packet_len, fp) != packet_len) {
+        fclose(fp);
+        return;
+    }
+
+    fclose(fp);
+
+    (void)ensure_generated_world_region_chunk_stub(world_root, chunk_x, chunk_z);
+}
+
+static void prewarm_generated_chunk_cache(const server_config_t *server_config,
+                                          int32_t center_chunk_x,
+                                          int32_t center_chunk_z,
+                                          int radius) {
+    int generated_count = 0;
+
+    if (server_config == NULL || radius < 0) {
+        return;
+    }
+
+    for (int dz = -radius; dz <= radius; ++dz) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            int32_t chunk_x = center_chunk_x + dx;
+            int32_t chunk_z = center_chunk_z + dz;
+            uint8_t *cached_packet = NULL;
+            size_t cached_packet_len = 0;
+
+            if (load_cached_generated_chunk_packet(server_config,
+                                                   chunk_x,
+                                                   chunk_z,
+                                                   &cached_packet,
+                                                   &cached_packet_len)) {
+                char world_root[1024];
+                if (resolve_generated_world_root(server_config, world_root, sizeof(world_root))) {
+                    (void)ensure_generated_world_region_chunk_stub(world_root, chunk_x, chunk_z);
+                }
+                free(cached_packet);
+                continue;
+            }
+
+            {
+                size_t packet_len = 0;
+                uint8_t *packet = build_generated_overworld_chunk_packet(chunk_x, chunk_z, &packet_len);
+                if (packet == NULL) {
+                    uint8_t *chunk_nbt = NULL;
+                    size_t chunk_nbt_len = 0;
+                    if (build_generated_chunk_nbt_payload(chunk_x, chunk_z, &chunk_nbt, &chunk_nbt_len)) {
+                        packet = build_chunk_data_packet(chunk_nbt,
+                                                         chunk_nbt_len,
+                                                         chunk_x,
+                                                         chunk_z,
+                                                         &packet_len);
+                        free(chunk_nbt);
+                    }
+                }
+                if (packet != NULL) {
+                    save_cached_generated_chunk_packet(server_config,
+                                                       chunk_x,
+                                                       chunk_z,
+                                                       packet,
+                                                       packet_len);
+                    free(packet);
+                    generated_count += 1;
+                }
+            }
+        }
+    }
+
+    if (generated_count > 0) {
+        printf("Prewarmed %d generated chunk cache files around (%d,%d) radius=%d.\n",
+               generated_count,
+               center_chunk_x,
+               center_chunk_z,
+               radius);
+    }
+}
+
+static void ensure_generated_world_scaffold(const server_config_t *server_config) {
+    char exe_dir[1024];
+    char world_root[1024];
+    char region_dir[1024];
+    char generated_packets_dir[1024];
+    char dim_nether[1024];
+    char dim_nether_region[1024];
+    char dim_end[1024];
+    char dim_end_region[1024];
+    char marker_path[1024];
+    FILE *fp;
+    int force_debug;
+    int resolved_mode;
+
+    if (server_config == NULL) {
+        return;
+    }
+
+    force_debug = server_config->force_debug_spawn || env_flag_enabled("VECTORA_FORCE_DEBUG_SPAWN");
+    resolved_mode = force_debug ? WORLD_SOURCE_MODE_DEBUG : server_config->world_source_mode;
+    if (resolved_mode != WORLD_SOURCE_MODE_GENERATED) {
+        return;
+    }
+
+    (void)exe_dir;
+    if (!resolve_generated_world_root(server_config, world_root, sizeof(world_root))) {
+        return;
+    }
+
+    if (!create_dir_if_missing(world_root)) {
+        printf("WARNING: failed to create generated world root at %s\n", world_root);
+        return;
+    }
+
+#ifdef _WIN32
+    snprintf(region_dir, sizeof(region_dir), "%s\\region", world_root);
+    snprintf(generated_packets_dir, sizeof(generated_packets_dir), "%s\\generated_packets", world_root);
+    snprintf(dim_nether, sizeof(dim_nether), "%s\\DIM-1", world_root);
+    snprintf(dim_nether_region, sizeof(dim_nether_region), "%s\\region", dim_nether);
+    snprintf(dim_end, sizeof(dim_end), "%s\\DIM1", world_root);
+    snprintf(dim_end_region, sizeof(dim_end_region), "%s\\region", dim_end);
+    snprintf(marker_path, sizeof(marker_path), "%s\\GENERATED_WORLD.txt", world_root);
+#else
+    snprintf(region_dir, sizeof(region_dir), "%s/region", world_root);
+    snprintf(generated_packets_dir, sizeof(generated_packets_dir), "%s/generated_packets", world_root);
+    snprintf(dim_nether, sizeof(dim_nether), "%s/DIM-1", world_root);
+    snprintf(dim_nether_region, sizeof(dim_nether_region), "%s/region", dim_nether);
+    snprintf(dim_end, sizeof(dim_end), "%s/DIM1", world_root);
+    snprintf(dim_end_region, sizeof(dim_end_region), "%s/region", dim_end);
+    snprintf(marker_path, sizeof(marker_path), "%s/GENERATED_WORLD.txt", world_root);
+#endif
+
+    (void)create_dir_if_missing(region_dir);
+    (void)create_dir_if_missing(generated_packets_dir);
+    (void)create_dir_if_missing(dim_nether);
+    (void)create_dir_if_missing(dim_nether_region);
+    (void)create_dir_if_missing(dim_end);
+    (void)create_dir_if_missing(dim_end_region);
+
+    fp = fopen(marker_path, "rb");
+    if (fp != NULL) {
+        fclose(fp);
+    } else {
+        fp = fopen(marker_path, "wb");
+        if (fp != NULL) {
+            const char *text =
+                "Vectora generated world scaffold\n"
+                "This folder was created automatically for world_source=generated.\n"
+                "Chunk terrain is generated procedurally and persisted to generated packet cache and region files.\n";
+            fwrite(text, 1, strlen(text), fp);
+            fclose(fp);
+        }
+    }
+
+    ensure_generated_world_level_dat(world_root);
+    ensure_generated_world_session_lock(world_root);
+    if (ensure_generated_world_region_chunk_stub(world_root, 0, 0)) {
+        printf("Generated region stub entry ensured for chunk (0,0).\n");
+    }
+
+    printf("Generated world scaffold ready at %s\n", world_root);
 }
 
 static int load_config_replay_with_fallbacks(config_replay_t *replay, const char **loaded_path) {
@@ -3636,32 +5048,48 @@ static void handle_client_connection(client_session_t *session) {
                                 {
                                     world_info_t world_info;
                                     char world_error[256];
-                                    int has_world_info = load_world_info(
-                                        &world_info,
-                                        server_config.world_path,
-                                        world_error,
-                                        sizeof(world_error));
+                                    int startup_force_debug_spawn = server_config.force_debug_spawn || env_flag_enabled("VECTORA_FORCE_DEBUG_SPAWN");
+                                    int startup_world_source_mode = startup_force_debug_spawn ? WORLD_SOURCE_MODE_DEBUG : server_config.world_source_mode;
+                                    int should_attempt_world_load =
+                                        (startup_world_source_mode == WORLD_SOURCE_MODE_AUTO || startup_world_source_mode == WORLD_SOURCE_MODE_REAL);
+                                    int has_world_info = 0;
 
-                                    if (has_world_info) {
-                                        printf("Loaded world '%s' spawn=(%d,%d,%d) chunk=(%d,%d) chunk_nbt=%s (%zu bytes)\n",
-                                            world_info.world_path,
-                                            world_info.spawn_x,
-                                            world_info.spawn_y,
-                                            world_info.spawn_z,
-                                            world_info.spawn_chunk_x,
-                                            world_info.spawn_chunk_z,
-                                            world_info.has_spawn_chunk ? "yes" : "no",
-                                            world_info.spawn_chunk_nbt_len);
+                                    if (should_attempt_world_load) {
+                                        has_world_info = load_world_info(
+                                            &world_info,
+                                            server_config.world_path,
+                                            world_error,
+                                            sizeof(world_error));
+
+                                        if (has_world_info) {
+                                            printf("Loaded world '%s' spawn=(%d,%d,%d) chunk=(%d,%d) chunk_nbt=%s (%zu bytes)\n",
+                                                world_info.world_path,
+                                                world_info.spawn_x,
+                                                world_info.spawn_y,
+                                                world_info.spawn_z,
+                                                world_info.spawn_chunk_x,
+                                                world_info.spawn_chunk_z,
+                                                world_info.has_spawn_chunk ? "yes" : "no",
+                                                world_info.spawn_chunk_nbt_len);
+                                        } else {
+                                            printf("World data not loaded: %s\n", world_error);
+                                        }
                                     } else {
-                                        printf("World data not loaded: %s\n", world_error);
+                                        printf("Skipping world folder load because world source mode is %s.\n",
+                                               world_source_mode_name(startup_world_source_mode));
                                     }
 
                                     {
-                                            int force_debug_spawn = server_config.force_debug_spawn || env_flag_enabled("VECTORA_FORCE_DEBUG_SPAWN");
-                                            int effective_world_source_mode = force_debug_spawn ? WORLD_SOURCE_MODE_DEBUG : server_config.world_source_mode;
+                                        int force_debug_spawn = server_config.force_debug_spawn || env_flag_enabled("VECTORA_FORCE_DEBUG_SPAWN");
+                                        int effective_world_source_mode = force_debug_spawn ? WORLD_SOURCE_MODE_DEBUG : server_config.world_source_mode;
                                         if (force_debug_spawn) {
-                                                printf("VECTORA_FORCE_DEBUG_SPAWN enabled: forcing debug chunks and debug spawn.\n");
+                                            printf("VECTORA_FORCE_DEBUG_SPAWN enabled: forcing debug chunks and debug spawn.\n");
                                         }
+                                        printf("World source mode resolved to %s (configured=%s, real_chunks=%s, debug_fallback=%s).\n",
+                                               world_source_mode_name(effective_world_source_mode),
+                                               world_source_mode_name(server_config.world_source_mode),
+                                               server_config.enable_real_chunks ? "on" : "off",
+                                               server_config.allow_debug_chunk_fallback ? "on" : "off");
 
                                         // Join Game
                                         {
@@ -3736,7 +5164,12 @@ static void handle_client_connection(client_session_t *session) {
                                             int32_t player_spawn_z = debug_spawn_z;
                                             chunk_send_result_t center_chunk_result = CHUNK_SEND_RESULT_NONE;
                                             int use_real_spawn = 0;
-                                            session->stream_state.chunk_stream_radius = resolve_chunk_stream_radius(&server_config);
+                                            session->stream_state.chunk_stream_radius =
+                                                resolve_chunk_stream_radius_for_world_source(&server_config,
+                                                                                             effective_world_source_mode);
+                                              printf("Chunk stream radius resolved to %d for world_source=%s.\n",
+                                                  session->stream_state.chunk_stream_radius,
+                                                  world_source_mode_name(effective_world_source_mode));
                                             session->stream_state.stream_center_chunk_x = debug_chunk_x;
                                             session->stream_state.stream_center_chunk_z = debug_chunk_z;
                                             session->stream_state.force_debug_spawn = force_debug_spawn;
@@ -3780,7 +5213,10 @@ static void handle_client_connection(client_session_t *session) {
                                                                     center_chunk_result = send_result;
                                                                 }
                                                             } else {
-                                                                printf("WARNING: no chunk sent for (%d,%d) with world_source=%d.\n", sx, sz, effective_world_source_mode);
+                                                                printf("WARNING: no chunk sent for (%d,%d) with world_source=%s.\n",
+                                                                       sx,
+                                                                       sz,
+                                                                       world_source_mode_name(effective_world_source_mode));
                                                             }
                                                         }
                                                     }
@@ -4087,6 +5523,35 @@ int main() {
         printf("Loaded server config from %s\n", server_config_path);
     } else {
         printf("Server config not found, using built-in defaults.\n");
+    }
+
+    {
+        int startup_force_debug_spawn = server_config.force_debug_spawn || env_flag_enabled("VECTORA_FORCE_DEBUG_SPAWN");
+        int startup_world_source_mode = startup_force_debug_spawn ? WORLD_SOURCE_MODE_DEBUG : server_config.world_source_mode;
+
+        printf("World source mode: %s (configured=%s, real_chunks=%s, debug_fallback=%s).\n",
+               world_source_mode_name(startup_world_source_mode),
+               world_source_mode_name(server_config.world_source_mode),
+               server_config.enable_real_chunks ? "on" : "off",
+               server_config.allow_debug_chunk_fallback ? "on" : "off");
+    }
+
+    ensure_generated_world_scaffold(&server_config);
+
+    {
+        int startup_force_debug_spawn = server_config.force_debug_spawn || env_flag_enabled("VECTORA_FORCE_DEBUG_SPAWN");
+        int startup_world_source_mode = startup_force_debug_spawn ? WORLD_SOURCE_MODE_DEBUG : server_config.world_source_mode;
+        int prewarm_radius = resolve_chunk_stream_radius_for_world_source(&server_config,
+                                                                           startup_world_source_mode);
+        if (startup_world_source_mode == WORLD_SOURCE_MODE_GENERATED) {
+            if (prewarm_radius > 2) {
+                prewarm_radius = 2;
+            }
+            prewarm_generated_chunk_cache(&server_config, 0, 0, prewarm_radius);
+            if (server_config.log_generated_region_summary) {
+                log_generated_region_index_summary(&server_config, 0, 0, prewarm_radius);
+            }
+        }
     }
 
     // Use SOCKET type for Windows, int for others

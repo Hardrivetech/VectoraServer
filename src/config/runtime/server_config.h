@@ -59,6 +59,7 @@ typedef struct {
     int log_play_session_summary;
     int log_entity_events;
     int log_chunk_sends;
+    int log_generated_region_summary;
     int offline_mode;
     char server_brand[64];
     char protocol_name[64];

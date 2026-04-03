@@ -365,6 +365,10 @@ static int assign_config_value(server_config_t *config, const char *key, const c
         config->log_chunk_sends = parsed;
         return 1;
     }
+    if (strcmp(key, "log_generated_region_summary") == 0) {
+        config->log_generated_region_summary = parsed;
+        return 1;
+    }
     if (strcmp(key, "offline_mode") == 0) {
         config->offline_mode = parsed;
         return 1;
@@ -467,6 +471,7 @@ void set_server_config_defaults(server_config_t *config) {
     config->log_play_session_summary = 1;
     config->log_entity_events = 0;
     config->log_chunk_sends = 1;
+    config->log_generated_region_summary = 1;
     config->offline_mode = 1;
     snprintf(config->server_brand, sizeof(config->server_brand), "%s", "Vectora");
     snprintf(config->protocol_name, sizeof(config->protocol_name), "%s", "Vectora 1.21.11");
