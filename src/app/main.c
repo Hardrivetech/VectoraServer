@@ -86,11 +86,28 @@ static socket_handle_t g_listen_socket = -1;
 static void append_lifecycle_log(const char *fmt, ...) {
     FILE *f;
     va_list ap;
+    char ts[32];
+    time_t now;
+    struct tm tm_local;
 
     f = fopen("lifecycle.log", "a");
     if (f == NULL) {
         return;
     }
+
+    now = time(NULL);
+#ifdef _WIN32
+    localtime_s(&tm_local, &now);
+#else
+    localtime_r(&now, &tm_local);
+#endif
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_local);
+
+#ifdef _WIN32
+    fprintf(f, "[%s pid=%lu] ", ts, (unsigned long)GetCurrentProcessId());
+#else
+    fprintf(f, "[%s pid=%ld] ", ts, (long)getpid());
+#endif
 
     va_start(ap, fmt);
     vfprintf(f, fmt, ap);
@@ -138,6 +155,7 @@ static volatile LONG g_active_connections = 0;
 
 static LONG WINAPI vectora_unhandled_exception_filter(EXCEPTION_POINTERS *ep) {
     DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    append_lifecycle_log("[FATAL] Unhandled process exception code=0x%08lX", (unsigned long)code);
     fprintf(stderr, "[FATAL] Unhandled process exception (code=0x%08lX).\n", (unsigned long)code);
     fflush(stderr);
     return EXCEPTION_EXECUTE_HANDLER;
@@ -152,16 +170,19 @@ static void vectora_invalid_parameter_handler(const wchar_t *expression,
     (void)function;
     (void)file;
     (void)pReserved;
+    append_lifecycle_log("[FATAL] CRT invalid parameter handler triggered line=%u", line);
     fprintf(stderr, "[FATAL] CRT invalid parameter handler triggered (line=%u).\n", line);
     fflush(stderr);
 }
 
 static void vectora_signal_handler(int sig) {
+    append_lifecycle_log("[FATAL] Signal handler invoked signal=%d", sig);
     fprintf(stderr, "[FATAL] Signal handler invoked (signal=%d).\n", sig);
     fflush(stderr);
 }
 
 static void vectora_process_exit_marker(void) {
+    append_lifecycle_log("[INFO] Process exiting via normal atexit path");
     fprintf(stderr, "[INFO] Process exiting via normal atexit path.\n");
     fflush(stderr);
 }
@@ -3286,11 +3307,16 @@ static int read_post_compression_packet_id(const uint8_t *buf, size_t buf_len, i
     return 1;
 }
 
-static size_t double_frame_packet(uint8_t *dst, const uint8_t *src, size_t len) {
+static size_t double_frame_packet(uint8_t *dst, size_t dst_cap, const uint8_t *src, size_t len) {
     size_t off = 0;
     uint8_t inner[4096];
     size_t inner_off = 0;
     int compress = (int)len >= compression_threshold;
+
+    if (dst == NULL || src == NULL || dst_cap == 0) {
+        return 0;
+    }
+
     if (compress) {
         // Compress with zlib
         uLongf comp_len = sizeof(inner) - 5; // leave space for VarInt
@@ -3303,8 +3329,15 @@ static size_t double_frame_packet(uint8_t *dst, const uint8_t *src, size_t len) 
         size_t varint_len = write_varint(inner, (int)len);
         memmove(inner + varint_len, inner + 5, comp_len);
         inner_off = varint_len + comp_len;
+        if (inner_off > sizeof(inner)) {
+            return 0;
+        }
         // Write total length
         off += write_varint(dst + off, (int)inner_off);
+        if (off + inner_off > dst_cap) {
+            printf("[double_frame_packet] dst too small: need=%zu, cap=%zu\n", off + inner_off, dst_cap);
+            return 0;
+        }
         memcpy(dst + off, inner, inner_off);
         if (g_log_packet_framing) {
             printf("[double_frame_packet] COMPRESSED: orig=%zu, comp=%lu, inner_varint=%d\n", len, comp_len, (int)len);
@@ -3323,15 +3356,22 @@ static size_t double_frame_packet(uint8_t *dst, const uint8_t *src, size_t len) 
             printf("\n");
         }
         inner_off += varint_len + len;
+        if (inner_off > sizeof(inner)) {
+            return 0;
+        }
         // Write total length (length of inner frame)
         off += write_varint(dst + off, (int)inner_off);
+        if (off + inner_off > dst_cap) {
+            printf("[double_frame_packet] dst too small: need=%zu, cap=%zu\n", off + inner_off, dst_cap);
+            return 0;
+        }
         memcpy(dst + off, inner, inner_off);
     }
     if (g_log_packet_framing) {
         printf("[double_frame_packet] inner (hex): ");
         for (size_t i = 0; i < inner_off; ++i) printf("%02X ", inner[i]);
         printf("\n[double_frame_packet] outer (hex): ");
-        for (size_t i = 0; i < off + inner_off; ++i) printf("%02X ", dst[i]);
+        for (size_t i = 0; i < off + inner_off && i < dst_cap; ++i) printf("%02X ", dst[i]);
         printf("\n");
     }
     return off + inner_off;
@@ -3666,8 +3706,16 @@ static void reconcile_tracked_spawned_entities_visibility(client_session_t *sess
 }
 
 static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_t *packet, size_t packet_len) {
+    if (packet == NULL || packet_len == 0) {
+        if (g_log_packet_framing) {
+            fprintf(stderr, "[WARN] Dropping empty post-compression packet send.\n");
+            fflush(stderr);
+        }
+        return;
+    }
+
     uint8_t framed[8192];
-    size_t framed_len = double_frame_packet(framed, packet, packet_len);
+    size_t framed_len = double_frame_packet(framed, sizeof(framed), packet, packet_len);
 
     if (framed_len == 0) {
         return;
@@ -3685,6 +3733,14 @@ static void send_large_post_compression_packet(socket_handle_t socket_fd,
     size_t  outer_vi_len, inner_vi_len;
     uint8_t *frame = NULL;
     size_t   frame_len;
+
+    if (packet == NULL || packet_len == 0) {
+        if (g_log_packet_framing) {
+            fprintf(stderr, "[WARN] Dropping empty large post-compression packet send.\n");
+            fflush(stderr);
+        }
+        return;
+    }
 
     if ((int)packet_len >= compression_threshold) {
         uLongf comp_bound = compressBound((uLong)packet_len);
@@ -5263,6 +5319,12 @@ static void handle_client_connection(client_session_t *session) {
                 extern size_t write_varint(uint8_t *, int32_t);
                 size_t uname_len = strlen(username);
                 size_t uname_varint = write_varint(unamebuf, (int32_t)uname_len);
+                if (uname_len > 32 || uname_varint + uname_len > sizeof(unamebuf)) {
+                    printf("[LOGIN] ERROR: Username too long for Login Success encoding (len=%zu).\n", uname_len);
+                    free(username);
+                    close_client_socket(new_socket);
+                    return;
+                }
                 memcpy(unamebuf + uname_varint, username, uname_len);
 
                 // Print username encoding for debug
@@ -5274,6 +5336,12 @@ static void handle_client_connection(client_session_t *session) {
                 // Build Login Success packet (raw, no length prefix)
                 uint8_t packet[128];
                 size_t offset = 0;
+                if (1 + sizeof(uuid) + uname_varint + uname_len + 1 > sizeof(packet)) {
+                    printf("[LOGIN] ERROR: Login Success packet would overflow fixed buffer.\n");
+                    free(username);
+                    close_client_socket(new_socket);
+                    return;
+                }
                 offset += write_varint(packet + offset, 0x02); // Login Success packet id
                 memcpy(packet + offset, uuid, sizeof(uuid));
                 offset += sizeof(uuid);
@@ -5289,7 +5357,7 @@ static void handle_client_connection(client_session_t *session) {
 
                 // Login Success double-framing (pass only raw packet, no length prefix)
                 uint8_t double_framed[512];
-                size_t double_framed_len = double_frame_packet(double_framed, packet, offset);
+                size_t double_framed_len = double_frame_packet(double_framed, sizeof(double_framed), packet, offset);
                 printf("Double Framed Login Success packet (hex): ");
                 for (size_t i = 0; i < double_framed_len; ++i) printf("%02X ", double_framed[i]);
                 printf("\n");
@@ -5332,14 +5400,27 @@ static void handle_client_connection(client_session_t *session) {
                                 config_replay_t replay;
                                 const char *replay_path = NULL;
                                 int have_replay;
-                                uint8_t cfg_buf[2048]; // 2048 to accommodate damage_type (50 entries ~1400 bytes)
+                                uint8_t *cfg_buf = NULL;
+                                size_t cfg_buf_cap = 8192;
                                 size_t cfg_len;
-                                uint8_t double_framed[2048];
+                                uint8_t *double_framed = NULL;
+                                size_t double_framed_cap = 16384;
                                 size_t double_framed_len;
 
+                                cfg_buf = (uint8_t *)malloc(cfg_buf_cap);
+                                double_framed = (uint8_t *)malloc(double_framed_cap);
+                                if (cfg_buf == NULL || double_framed == NULL) {
+                                    printf("[LOGIN] ERROR: Failed to allocate config staging buffers.\n");
+                                    free(double_framed);
+                                    free(cfg_buf);
+                                    free(username);
+                                    close_client_socket(new_socket);
+                                    return;
+                                }
+
                                 // Known Packs (required for proper registry bootstrap in 1.21+)
-                                cfg_len = build_known_packs_packet(cfg_buf, sizeof(cfg_buf));
-                                double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                cfg_len = build_known_packs_packet(cfg_buf, cfg_buf_cap);
+                                double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                 send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5377,6 +5458,8 @@ static void handle_client_connection(client_session_t *session) {
 
                                     if (!got_known_packs) {
                                         printf("Did not receive Serverbound Known Packs (0x07).\n");
+                                        free(double_framed);
+                                        free(cfg_buf);
                                         free(username);
                                         close_client_socket(new_socket);
                                         return;
@@ -5393,7 +5476,7 @@ static void handle_client_connection(client_session_t *session) {
                                         size_t plen = replay.lengths[i];
 
                                         replay_pid = read_varint(&pptr, &plen);
-                                        double_framed_len = double_frame_packet(double_framed, replay.packets[i], replay.lengths[i]);
+                                        double_framed_len = double_frame_packet(double_framed, double_framed_cap, replay.packets[i], replay.lengths[i]);
 #ifdef _WIN32
                                         send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5406,8 +5489,8 @@ static void handle_client_connection(client_session_t *session) {
                                     }
 
                                     if (!replay_sent_finish) {
-                                        cfg_len = build_finish_config_packet(cfg_buf, sizeof(cfg_buf));
-                                        double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                        cfg_len = build_finish_config_packet(cfg_buf, cfg_buf_cap);
+                                        double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                         send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5417,8 +5500,8 @@ static void handle_client_connection(client_session_t *session) {
                                     }
                                 } else {
                                     // Minimal fallback when no replay file is present.
-                                    cfg_len = build_feature_flags_packet(cfg_buf, sizeof(cfg_buf));
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_feature_flags_packet(cfg_buf, cfg_buf_cap);
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5426,8 +5509,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Feature Flags to client.\n");
 
-                                    cfg_len = build_registry_data_packet(cfg_buf, sizeof(cfg_buf));
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_packet(cfg_buf, cfg_buf_cap);
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5435,8 +5518,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (dimension_type) to client.\n");
 
-                                    cfg_len = build_registry_data_biome_packet(cfg_buf, sizeof(cfg_buf));
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_biome_packet(cfg_buf, cfg_buf_cap);
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5444,8 +5527,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (biome) to client.\n");
 
-                                    cfg_len = build_registry_data_damage_type(cfg_buf, sizeof(cfg_buf));
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_damage_type(cfg_buf, cfg_buf_cap);
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5454,8 +5537,8 @@ static void handle_client_connection(client_session_t *session) {
                                     printf("Sent Registry Data (damage_type) to client.\n");
 
                                     // Required non-empty dynamic registries added in 1.21.5+
-                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:cat_variant", "minecraft:tabby");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_one(cfg_buf, cfg_buf_cap, "minecraft:cat_variant", "minecraft:tabby");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5463,8 +5546,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (cat_variant) to client.\n");
 
-                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:chicken_variant", "minecraft:temperate");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_one(cfg_buf, cfg_buf_cap, "minecraft:chicken_variant", "minecraft:temperate");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5472,8 +5555,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (chicken_variant) to client.\n");
 
-                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:cow_variant", "minecraft:temperate");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_one(cfg_buf, cfg_buf_cap, "minecraft:cow_variant", "minecraft:temperate");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5481,8 +5564,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (cow_variant) to client.\n");
 
-                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:frog_variant", "minecraft:temperate");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_one(cfg_buf, cfg_buf_cap, "minecraft:frog_variant", "minecraft:temperate");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5490,8 +5573,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (frog_variant) to client.\n");
 
-                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:painting_variant", "minecraft:kebab");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_one(cfg_buf, cfg_buf_cap, "minecraft:painting_variant", "minecraft:kebab");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5499,8 +5582,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (painting_variant) to client.\n");
 
-                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:pig_variant", "minecraft:temperate");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_one(cfg_buf, cfg_buf_cap, "minecraft:pig_variant", "minecraft:temperate");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5508,8 +5591,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (pig_variant) to client.\n");
 
-                                    cfg_len = build_registry_data_inline_empty(cfg_buf, sizeof(cfg_buf), "minecraft:timeline", "minecraft:overworld");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_inline_empty(cfg_buf, cfg_buf_cap, "minecraft:timeline", "minecraft:overworld");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5517,8 +5600,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (timeline) to client.\n");
 
-                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:wolf_sound_variant", "minecraft:classic");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_one(cfg_buf, cfg_buf_cap, "minecraft:wolf_sound_variant", "minecraft:classic");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5526,8 +5609,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (wolf_sound_variant) to client.\n");
 
-                                    cfg_len = build_registry_data_one(cfg_buf, sizeof(cfg_buf), "minecraft:wolf_variant", "minecraft:pale");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_one(cfg_buf, cfg_buf_cap, "minecraft:wolf_variant", "minecraft:pale");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5535,8 +5618,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Registry Data (wolf_variant) to client.\n");
 
-                                    cfg_len = build_registry_data_with_asset_id(cfg_buf, sizeof(cfg_buf), "minecraft:zombie_nautilus_variant", "minecraft:temperate", "minecraft:zombie_nautilus");
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_registry_data_with_asset_id(cfg_buf, cfg_buf_cap, "minecraft:zombie_nautilus_variant", "minecraft:temperate", "minecraft:zombie_nautilus");
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5545,8 +5628,8 @@ static void handle_client_connection(client_session_t *session) {
                                     printf("Sent Registry Data (zombie_nautilus_variant) to client.\n");
 
                                     // Update Tags: bind minecraft:timeline#minecraft:in_overworld to entry 0
-                                    cfg_len = build_update_tags_with_timeline(cfg_buf, sizeof(cfg_buf));
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_update_tags_with_timeline(cfg_buf, cfg_buf_cap);
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5554,8 +5637,8 @@ static void handle_client_connection(client_session_t *session) {
 #endif
                                     printf("Sent Update Tags to client.\n");
 
-                                    cfg_len = build_finish_config_packet(cfg_buf, sizeof(cfg_buf));
-                                    double_framed_len = double_frame_packet(double_framed, cfg_buf, cfg_len);
+                                    cfg_len = build_finish_config_packet(cfg_buf, cfg_buf_cap);
+                                    double_framed_len = double_frame_packet(double_framed, double_framed_cap, cfg_buf, cfg_len);
 #ifdef _WIN32
                                     send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
 #else
@@ -5597,6 +5680,8 @@ static void handle_client_connection(client_session_t *session) {
                                     if (!got_finish_ack) {
                                         free_config_replay(&replay);
                                         printf("Did not receive Acknowledge Finish Configuration (0x03).\n");
+                                        free(double_framed);
+                                        free(cfg_buf);
                                         free(username);
                                         close_client_socket(new_socket);
                                         return;
@@ -5604,6 +5689,8 @@ static void handle_client_connection(client_session_t *session) {
                                 }
 
                                 free_config_replay(&replay);
+                                free(double_framed);
+                                free(cfg_buf);
 
                                 // Load world metadata for play bootstrap if a world folder is available.
                                 {
@@ -6265,7 +6352,13 @@ int main() {
 
 #ifdef _WIN32
             {
-                HANDLE thread_handle = CreateThread(NULL, 0, client_worker_thread, session, 0, NULL);
+                SIZE_T worker_stack_size = 8 * 1024 * 1024;
+                HANDLE thread_handle = CreateThread(NULL,
+                                                    worker_stack_size,
+                                                    client_worker_thread,
+                                                    session,
+                                                    0,
+                                                    NULL);
                 if (thread_handle == NULL) {
                     fprintf(stderr, "CreateThread failed for client session.\n");
                     close_client_socket(new_socket);

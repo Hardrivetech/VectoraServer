@@ -5,6 +5,10 @@
 
 #include <string.h>
 
+static int has_room(size_t offset, size_t need, size_t capacity) {
+    return offset <= capacity && need <= (capacity - offset);
+}
+
 static void write_u32_be(uint8_t *dst, uint32_t value) {
     dst[0] = (uint8_t)((value >> 24) & 0xFF);
     dst[1] = (uint8_t)((value >> 16) & 0xFF);
@@ -58,7 +62,10 @@ static void write_position_be(uint8_t *dst, int32_t x, int32_t y, int32_t z) {
 size_t build_set_center_chunk_packet(uint8_t *outbuf, size_t outbuf_size, int32_t chunk_x, int32_t chunk_z) {
     size_t offset = 0;
 
-    (void)outbuf_size;
+    if (outbuf == NULL || outbuf_size < 15) {
+        return 0;
+    }
+
     offset += write_varint(outbuf + offset, PLAY_PKT_SET_CENTER_CHUNK);
     offset += write_varint(outbuf + offset, chunk_x);
     offset += write_varint(outbuf + offset, chunk_z);
@@ -175,15 +182,30 @@ size_t build_entity_destroy_packet(uint8_t *outbuf,
                                    size_t entity_count) {
     size_t offset = 0;
 
-    (void)outbuf_size;
-    if (entity_ids == NULL || entity_count == 0) {
+    if (outbuf == NULL || entity_ids == NULL || entity_count == 0) {
+        return 0;
+    }
+
+    if (outbuf_size < 2) {
         return 0;
     }
 
     offset += write_varint(outbuf + offset, PLAY774_PKT_REMOVE_ENTITIES);
+    if (offset > outbuf_size) {
+        return 0;
+    }
     offset += write_varint(outbuf + offset, (int32_t)entity_count);
+    if (offset > outbuf_size) {
+        return 0;
+    }
     for (size_t i = 0; i < entity_count; ++i) {
+        if (!has_room(offset, 5, outbuf_size)) {
+            return 0;
+        }
         offset += write_varint(outbuf + offset, entity_ids[i]);
+        if (offset > outbuf_size) {
+            return 0;
+        }
     }
     return offset;
 }
@@ -201,7 +223,14 @@ size_t build_spawn_entity_packet(uint8_t *outbuf,
                                  int32_t data) {
     size_t offset = 0;
 
-    (void)outbuf_size;
+    if (outbuf == NULL) {
+        return 0;
+    }
+
+    // Worst-case encoded size is comfortably below 64 bytes.
+    if (outbuf_size < 64) {
+        return 0;
+    }
 
     // 0x01 add_entity (Spawn Entity) — verified for protocol 774 from minecraft.wiki
     offset += write_varint(outbuf + offset, PLAY774_PKT_SPAWN_ENTITY);
@@ -261,7 +290,9 @@ size_t build_move_entity_pos_packet(uint8_t *outbuf,
                                     int on_ground) {
     size_t offset = 0;
 
-    (void)outbuf_size;
+    if (outbuf == NULL || outbuf_size < 16) {
+        return 0;
+    }
 
     offset += write_varint(outbuf + offset, PLAY774_PKT_MOVE_ENTITY_POS);
     offset += write_varint(outbuf + offset, entity_id);
@@ -290,7 +321,9 @@ size_t build_entity_position_sync_packet(uint8_t *outbuf,
                                          int on_ground) {
     size_t offset = 0;
 
-    (void)outbuf_size;
+    if (outbuf == NULL || outbuf_size < 64) {
+        return 0;
+    }
 
     offset += write_varint(outbuf + offset, PLAY774_PKT_ENTITY_POSITION_SYNC);
     offset += write_varint(outbuf + offset, entity_id);
@@ -315,7 +348,9 @@ size_t build_set_head_rotation_packet(uint8_t *outbuf,
                                       float head_yaw) {
     size_t offset = 0;
 
-    (void)outbuf_size;
+    if (outbuf == NULL || outbuf_size < 8) {
+        return 0;
+    }
 
     offset += write_varint(outbuf + offset, PLAY774_PKT_SET_HEAD_ROTATION);
     offset += write_varint(outbuf + offset, entity_id);
@@ -337,7 +372,9 @@ size_t build_set_entity_glowing_packet(uint8_t *outbuf,
     size_t offset = 0;
     uint8_t flags = glowing ? 0x40 : 0x00;
 
-    (void)outbuf_size;
+    if (outbuf == NULL || outbuf_size < 16) {
+        return 0;
+    }
 
     offset += write_varint(outbuf + offset, PLAY774_PKT_SET_ENTITY_METADATA);
     offset += write_varint(outbuf + offset, entity_id);
@@ -362,7 +399,9 @@ size_t build_set_item_entity_slot_packet(uint8_t *outbuf,
                                          int32_t item_count) {
     size_t offset = 0;
 
-    (void)outbuf_size;
+    if (outbuf == NULL || outbuf_size < 32) {
+        return 0;
+    }
 
     if (item_count <= 0) {
         return 0;

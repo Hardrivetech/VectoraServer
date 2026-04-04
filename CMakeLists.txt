@@ -3,6 +3,8 @@ project(Vectora C)
 
 set(CMAKE_C_STANDARD 11)
 
+option(VECTORA_ENABLE_ASAN "Enable AddressSanitizer instrumentation" OFF)
+
 if (WIN32)
 	enable_language(RC)
 	set(VECTORA_ICON src/platform/windows/vectora.rc src/platform/windows/dummy_win32_icon.c)
@@ -44,3 +46,30 @@ target_include_directories(Vectora PRIVATE
 	src/play/entity
 	src/play/chunk
 )
+
+if (VECTORA_ENABLE_ASAN)
+	if (MSVC)
+		target_compile_options(Vectora PRIVATE /fsanitize=address /Zi)
+
+		# Make ASan builds runnable from the build output directory by copying
+		# sanitizer runtime DLLs next to the executable when they exist.
+		get_filename_component(_vectora_msvc_bin_dir "${CMAKE_C_COMPILER}" DIRECTORY)
+		set(_vectora_asan_dll_candidates
+			"${_vectora_msvc_bin_dir}/clang_rt.asan_dynamic-x86_64.dll"
+			"${_vectora_msvc_bin_dir}/clang_rt.asan_dbg_dynamic-x86_64.dll"
+		)
+
+		foreach(_vectora_asan_dll IN LISTS _vectora_asan_dll_candidates)
+			if (EXISTS "${_vectora_asan_dll}")
+				add_custom_command(TARGET Vectora POST_BUILD
+					COMMAND ${CMAKE_COMMAND} -E copy_if_different
+						"${_vectora_asan_dll}"
+						"$<TARGET_FILE_DIR:Vectora>"
+				)
+			endif()
+		endforeach()
+	else()
+		target_compile_options(Vectora PRIVATE -fsanitize=address -fno-omit-frame-pointer -g)
+		target_link_options(Vectora PRIVATE -fsanitize=address)
+	endif()
+endif()
