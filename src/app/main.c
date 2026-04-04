@@ -78,6 +78,7 @@ static int g_log_chunk_sends = 1;
 #define GENERATED_PACKET_CACHE_VERSION  18
 #define DROP_DEDUP_CACHE_SIZE           64
 #define DROP_DEDUP_WINDOW_SECONDS       2
+#define BROKEN_BLOCK_CACHE_SIZE         32768
 
 #ifdef _WIN32
 static socket_handle_t g_listen_socket = INVALID_SOCKET;
@@ -246,6 +247,13 @@ typedef struct {
 } recent_drop_entry_t;
 
 typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+    time_t at;
+} broken_block_entry_t;
+
+typedef struct {
     socket_handle_t socket_fd;
     socket_handle_t server_fd;
     server_config_t server_config;
@@ -277,6 +285,9 @@ typedef struct {
     time_t chat_rate_last_violation;
     recent_drop_entry_t recent_drops[DROP_DEDUP_CACHE_SIZE];
     size_t recent_drop_count;
+    broken_block_entry_t broken_blocks[BROKEN_BLOCK_CACHE_SIZE];
+    size_t broken_block_count;
+    time_t last_broken_block_reconcile_at;
 } client_session_t;
 
 typedef enum {
@@ -306,6 +317,9 @@ static int build_generated_chunk_nbt_payload(int32_t chunk_x,
                                              int32_t chunk_z,
                                              uint8_t **out_nbt,
                                              size_t *out_nbt_len);
+static void send_post_compression_packet(socket_handle_t socket_fd,
+                                         const uint8_t *packet,
+                                         size_t packet_len);
 
 static const char *world_source_mode_name(int mode) {
     switch (mode) {
@@ -468,6 +482,191 @@ static int should_spawn_block_drop(client_session_t *session,
     session->recent_drops[oldest_index].z = block_z;
     session->recent_drops[oldest_index].at = now_ts;
     return 1;
+}
+
+static int is_block_marked_broken(const client_session_t *session,
+                                  int32_t block_x,
+                                  int32_t block_y,
+                                  int32_t block_z) {
+    size_t i;
+
+    if (session == NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < session->broken_block_count; ++i) {
+        const broken_block_entry_t *entry = &session->broken_blocks[i];
+        if (entry->x == block_x && entry->y == block_y && entry->z == block_z) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void mark_block_broken(client_session_t *session,
+                              int32_t block_x,
+                              int32_t block_y,
+                              int32_t block_z,
+                              time_t now_ts) {
+    size_t i;
+    size_t oldest_index = 0;
+    time_t oldest_time = now_ts;
+
+    if (session == NULL) {
+        return;
+    }
+
+    for (i = 0; i < session->broken_block_count; ++i) {
+        broken_block_entry_t *entry = &session->broken_blocks[i];
+        if (entry->x == block_x && entry->y == block_y && entry->z == block_z) {
+            entry->at = now_ts;
+            return;
+        }
+    }
+
+    if (session->broken_block_count < BROKEN_BLOCK_CACHE_SIZE) {
+        broken_block_entry_t *entry = &session->broken_blocks[session->broken_block_count++];
+        entry->x = block_x;
+        entry->y = block_y;
+        entry->z = block_z;
+        entry->at = now_ts;
+        return;
+    }
+
+    oldest_time = session->broken_blocks[0].at;
+    for (i = 1; i < session->broken_block_count; ++i) {
+        if (session->broken_blocks[i].at < oldest_time) {
+            oldest_time = session->broken_blocks[i].at;
+            oldest_index = i;
+        }
+    }
+
+    session->broken_blocks[oldest_index].x = block_x;
+    session->broken_blocks[oldest_index].y = block_y;
+    session->broken_blocks[oldest_index].z = block_z;
+    session->broken_blocks[oldest_index].at = now_ts;
+}
+
+static int block_to_chunk_coord(int32_t block_coord) {
+    if (block_coord >= 0) {
+        return block_coord / 16;
+    }
+    return (block_coord - 15) / 16;
+}
+
+static void replay_broken_blocks_for_chunk(client_session_t *session,
+                                           int32_t chunk_x,
+                                           int32_t chunk_z) {
+    size_t i;
+
+    if (session == NULL || session->broken_block_count == 0) {
+        return;
+    }
+
+    for (i = 0; i < session->broken_block_count; ++i) {
+        const broken_block_entry_t *entry = &session->broken_blocks[i];
+        if (block_to_chunk_coord(entry->x) == chunk_x &&
+            block_to_chunk_coord(entry->z) == chunk_z) {
+            uint8_t bu_buf[32];
+            size_t bu_len = build_block_update_packet(bu_buf,
+                                                      sizeof(bu_buf),
+                                                      entry->x,
+                                                      entry->y,
+                                                      entry->z,
+                                                      PLAY774_BLOCK_STATE_AIR);
+            send_post_compression_packet(session->socket_fd, bu_buf, bu_len);
+        }
+    }
+}
+
+static void reconcile_broken_blocks_near_player(client_session_t *session,
+                                                double player_x,
+                                                double player_z) {
+    const double max_dist_sq = 192.0 * 192.0;
+    size_t n;
+    int sent = 0;
+
+    if (session == NULL || session->broken_block_count == 0) {
+        return;
+    }
+
+    for (n = session->broken_block_count; n > 0; --n) {
+        const broken_block_entry_t *entry = &session->broken_blocks[n - 1];
+        double dx = ((double)entry->x + 0.5) - player_x;
+        double dz = ((double)entry->z + 0.5) - player_z;
+        double dist_sq = dx * dx + dz * dz;
+
+        if (dist_sq <= max_dist_sq) {
+            uint8_t bu_buf[32];
+            size_t bu_len = build_block_update_packet(bu_buf,
+                                                      sizeof(bu_buf),
+                                                      entry->x,
+                                                      entry->y,
+                                                      entry->z,
+                                                      PLAY774_BLOCK_STATE_AIR);
+            send_post_compression_packet(session->socket_fd, bu_buf, bu_len);
+            sent += 1;
+            if (sent >= 256) {
+                break;
+            }
+        }
+    }
+}
+
+static int ensure_tracked_slot_for_drop(client_session_t *session,
+                                        socket_handle_t socket_fd) {
+    size_t i;
+    size_t oldest_item_index = SIZE_MAX;
+    size_t oldest_any_index = SIZE_MAX;
+    time_t oldest_item_birth = 0;
+    time_t oldest_any_birth = 0;
+    size_t tracked_cap;
+
+    if (session == NULL) {
+        return 0;
+    }
+
+    tracked_cap = sizeof(session->spawned_entity_ids) / sizeof(session->spawned_entity_ids[0]);
+    if (session->spawned_entity_count < tracked_cap) {
+        return 1;
+    }
+
+    for (i = 0; i < session->spawned_entity_count; ++i) {
+        time_t born = session->spawned_entity_birth_at[i];
+
+        if (oldest_any_index == SIZE_MAX || born < oldest_any_birth) {
+            oldest_any_index = i;
+            oldest_any_birth = born;
+        }
+
+        if (session->spawned_entity_types[i] == PLAY774_ENTITY_TYPE_ITEM) {
+            if (oldest_item_index == SIZE_MAX || born < oldest_item_birth) {
+                oldest_item_index = i;
+                oldest_item_birth = born;
+            }
+        }
+    }
+
+    if (oldest_item_index != SIZE_MAX || oldest_any_index != SIZE_MAX) {
+        size_t remove_index = (oldest_item_index != SIZE_MAX) ? oldest_item_index : oldest_any_index;
+        int32_t remove_id = session->spawned_entity_ids[remove_index];
+        int remove_visible = session->spawned_entity_visible[remove_index];
+
+        if (remove_visible) {
+            uint8_t rem_buf[64];
+            size_t rem_len = build_entity_destroy_packet(rem_buf, sizeof(rem_buf), &remove_id, 1);
+            send_post_compression_packet(socket_fd, rem_buf, rem_len);
+            session->entity_stats_destroy_packets_sent += 1;
+        }
+
+        (void)entity_manager_queue_remove(&session->entity_registry,
+                                          &session->entity_manager,
+                                          remove_id);
+        (void)untrack_spawned_entity_id(session, remove_id);
+    }
+
+    return session->spawned_entity_count < tracked_cap;
 }
 
 static int username_equals_ci(const char *a, const char *b) {
@@ -1846,6 +2045,10 @@ static int send_stream_chunk(client_session_t *session,
                 *out_result = CHUNK_SEND_RESULT_DEBUG;
             }
         }
+    }
+
+    if (sent_this) {
+        replay_broken_blocks_for_chunk(session, chunk_x, chunk_z);
     }
 
     return sent_this;
@@ -4375,6 +4578,12 @@ static void run_play_state_loop(client_session_t *session,
                 last_keepalive = now;
             }
 
+            if (has_last_activity_position &&
+                now - session->last_broken_block_reconcile_at >= 1) {
+                reconcile_broken_blocks_near_player(session, last_activity_x, last_activity_z);
+                session->last_broken_block_reconcile_at = now;
+            }
+
             if (session->server_config.log_entity_events &&
                 now - last_entity_event_log >= 1 &&
                 entity_manager_pending_count(&session->entity_manager) > 0) {
@@ -4726,6 +4935,14 @@ static void run_play_state_loop(client_session_t *session,
                                                               player_y,
                                                               player_z);
 
+                        {
+                            time_t reconcile_now = time(NULL);
+                            if (reconcile_now - session->last_broken_block_reconcile_at >= 1) {
+                                reconcile_broken_blocks_near_player(session, player_x, player_z);
+                                session->last_broken_block_reconcile_at = reconcile_now;
+                            }
+                        }
+
                         /* Auto-pickup for dropped item entities near the player. */
                         {
                             const double pickup_radius_sq = 2.25; /* 1.5 blocks */
@@ -4784,6 +5001,7 @@ static void run_play_state_loop(client_session_t *session,
                         int32_t dig_status = -1;
                         int32_t block_x = 0, block_y = 0, block_z = 0;
                         int32_t dig_sequence = -1;
+                        time_t break_ts = time(NULL);
 
                             parsed_dig = try_parse_block_dig_packet_774(play_payload,
                                                                          play_payload_len,
@@ -4809,9 +5027,23 @@ static void run_play_state_loop(client_session_t *session,
                             double drop_z = (double)block_z + 0.5;
                             gen_block_kind_t broken_kind = generated_world_block_kind(block_x, block_y, block_z);
 
-                            if (broken_kind == GEN_BLOCK_AIR || broken_kind == GEN_BLOCK_WATER) {
+                            if (block_y < -64 || block_y > 319) {
                                 goto block_dig_done;
                             }
+
+                            if (is_block_marked_broken(session, block_x, block_y, block_z)) {
+                                uint8_t bu_buf[32];
+                                size_t bu_len = build_block_update_packet(bu_buf,
+                                                                          sizeof(bu_buf),
+                                                                          block_x,
+                                                                          block_y,
+                                                                          block_z,
+                                                                          PLAY774_BLOCK_STATE_AIR);
+                                send_post_compression_packet(socket_fd, bu_buf, bu_len);
+                                goto block_dig_done;
+                            }
+
+                            mark_block_broken(session, block_x, block_y, block_z, break_ts);
 
                             {
                                 uint8_t bu_buf[32];
@@ -4828,7 +5060,8 @@ static void run_play_state_loop(client_session_t *session,
                                                         block_x,
                                                         block_y,
                                                         block_z,
-                                                        time(NULL)) &&
+                                                        break_ts) &&
+                                ensure_tracked_slot_for_drop(session, socket_fd) &&
                                 entity_manager_queue_spawn_auto(&session->entity_registry,
                                                                 &session->entity_manager,
                                                                 ENTITY_KIND_OBJECT,
@@ -4839,9 +5072,14 @@ static void run_play_state_loop(client_session_t *session,
                                 uint8_t se_buf[128];
                                 size_t se_len;
 
-                                (void)track_spawned_entity_id(session,
-                                                              drop_entity_id,
-                                                              PLAY774_ENTITY_TYPE_ITEM);
+                                if (!track_spawned_entity_id(session,
+                                                             drop_entity_id,
+                                                             PLAY774_ENTITY_TYPE_ITEM)) {
+                                    (void)entity_manager_queue_remove(&session->entity_registry,
+                                                                      &session->entity_manager,
+                                                                      drop_entity_id);
+                                    goto block_dig_done;
+                                }
 
                                 se_len = build_spawn_entity_packet(se_buf,
                                                                    sizeof(se_buf),
