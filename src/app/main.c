@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <limits.h>
 #include <time.h>
 #include <math.h>
 #include <signal.h>
@@ -66,6 +67,7 @@ static int g_log_chunk_sends = 1;
 #define PLAY774_S2C_SYSTEM_CHAT         0x77
 #define PLAY774_ENTITY_TYPE_ITEM        71
 #define PLAY774_ITEM_ID_STONE           1
+#define PLAY774_BLOCK_STATE_AIR         0
 #define PLAY774_BLOCK_DIG_START         0
 #define PLAY774_BLOCK_DIG_FINISH        2
 #define CHAT_RATE_MAX_MESSAGES          5
@@ -259,6 +261,9 @@ typedef struct {
     int32_t spawned_entity_ids[256];
     int32_t spawned_entity_types[256];
     int spawned_entity_visible[256];
+    time_t spawned_entity_birth_at[256];
+    double spawned_entity_vertical_velocity[256];
+    int spawned_entity_on_ground[256];
     size_t spawned_entity_count;
     uint64_t entity_stats_spawn_packets_sent;
     uint64_t entity_stats_destroy_packets_sent;
@@ -332,6 +337,9 @@ static int track_spawned_entity_id(client_session_t *session, int32_t entity_id,
     session->spawned_entity_ids[session->spawned_entity_count] = entity_id;
     session->spawned_entity_types[session->spawned_entity_count] = entity_type;
     session->spawned_entity_visible[session->spawned_entity_count] = 1;
+    session->spawned_entity_birth_at[session->spawned_entity_count] = time(NULL);
+    session->spawned_entity_vertical_velocity[session->spawned_entity_count] = 0.0;
+    session->spawned_entity_on_ground[session->spawned_entity_count] = 0;
     session->spawned_entity_count += 1;
     return 1;
 }
@@ -356,6 +364,15 @@ static int untrack_spawned_entity_id(client_session_t *session, int32_t entity_i
                 memmove(&session->spawned_entity_visible[i],
                     &session->spawned_entity_visible[i + 1],
                     tail * sizeof(session->spawned_entity_visible[0]));
+                memmove(&session->spawned_entity_birth_at[i],
+                    &session->spawned_entity_birth_at[i + 1],
+                    tail * sizeof(session->spawned_entity_birth_at[0]));
+                memmove(&session->spawned_entity_vertical_velocity[i],
+                    &session->spawned_entity_vertical_velocity[i + 1],
+                    tail * sizeof(session->spawned_entity_vertical_velocity[0]));
+                memmove(&session->spawned_entity_on_ground[i],
+                    &session->spawned_entity_on_ground[i + 1],
+                    tail * sizeof(session->spawned_entity_on_ground[0]));
             }
             session->spawned_entity_count -= 1;
             return 1;
@@ -1228,13 +1245,14 @@ static int try_parse_block_dig_packet_774(const uint8_t *payload,
                                           int32_t *out_status,
                                           int32_t *out_x,
                                           int32_t *out_y,
-                                          int32_t *out_z) {
+                                          int32_t *out_z,
+                                          int32_t *out_sequence) {
     const uint8_t *p = payload;
     size_t len = payload_len;
     int32_t status;
     uint64_t packed_pos;
 
-    if (payload == NULL || out_status == NULL || out_x == NULL || out_y == NULL || out_z == NULL) {
+    if (payload == NULL || out_status == NULL || out_x == NULL || out_y == NULL || out_z == NULL || out_sequence == NULL) {
         return 0;
     }
 
@@ -1260,8 +1278,12 @@ static int try_parse_block_dig_packet_774(const uint8_t *payload,
     len -= 1;
 
     /* sequence (varint) */
-    if (read_varint(&p, &len) < 0) {
-        return 0;
+    {
+        int32_t sequence = read_varint(&p, &len);
+        if (sequence < 0) {
+            return 0;
+        }
+        *out_sequence = sequence;
     }
 
     *out_status = status;
@@ -1639,6 +1661,17 @@ static const char *lookup_entity_name_by_type_774(int32_t entity_type) {
         case 150: return "zombie";
         default: return "unknown";
     }
+}
+
+static int32_t pick_roaming_mob_type(size_t index) {
+    static const int32_t types[] = { 30, 100, 111, 150, 115, 32, 124, 41 };
+    return types[index % (sizeof(types) / sizeof(types[0]))];
+}
+
+static double resolve_generated_ground_y(double x, double z) {
+    int32_t block_x = (int32_t)floor(x);
+    int32_t block_z = (int32_t)floor(z);
+    return (double)generated_world_surface_y(block_x, block_z) + 1.0;
 }
 
 static int send_stream_chunk(client_session_t *session,
@@ -3705,6 +3738,357 @@ static void reconcile_tracked_spawned_entities_visibility(client_session_t *sess
     }
 }
 
+static void tick_tracked_mob_movement(client_session_t *session,
+                                      socket_handle_t socket_fd,
+                                      uint64_t tick,
+                                      int has_player_anchor,
+                                      double player_x,
+                                      double player_z) {
+    size_t i;
+
+    if (session == NULL) {
+        return;
+    }
+
+    for (i = 0; i < session->spawned_entity_count; ++i) {
+        int32_t ent_id = session->spawned_entity_ids[i];
+        int32_t ent_type = session->spawned_entity_types[i];
+        double ex = 0.0;
+        double ey = 0.0;
+        double ez = 0.0;
+        double base_x;
+        double base_z;
+        double phase;
+        double radius;
+        double target_x;
+        double target_z;
+        double nx;
+        double ny;
+        double nz;
+        double ground_y;
+        double step_up;
+        double vertical_velocity;
+        int was_visible;
+        int on_ground;
+
+        if (ent_type == PLAY774_ENTITY_TYPE_ITEM) {
+            continue;
+        }
+
+        if (!find_entity_position(&session->entity_registry, ent_id, &ex, &ey, &ez)) {
+            continue;
+        }
+
+        base_x = has_player_anchor ? player_x : (double)(session->stream_state.stream_center_chunk_x * 16 + 8);
+        base_z = has_player_anchor ? player_z : (double)(session->stream_state.stream_center_chunk_z * 16 + 8);
+        phase = ((double)((tick + ((uint64_t)(ent_id & 0x7FFF) * 13ULL)) % 2400ULL)) * 0.00261799387799;
+        {
+            double base_radius = (double)session->server_config.entity_roam_radius_blocks;
+            if (base_radius < 1.0) {
+                base_radius = 1.0;
+            }
+            radius = base_radius * (0.55 + (double)(i % 6) * 0.10);
+        }
+        target_x = base_x + cos(phase + (double)i * 0.41) * radius;
+        target_z = base_z + sin((phase * 0.93) + (double)i * 0.29) * radius;
+
+        // Smoothly steer each mob toward its current orbit target.
+        nx = ex + (target_x - ex) * 0.10;
+        nz = ez + (target_z - ez) * 0.10;
+        ny = ey;
+        ground_y = resolve_generated_ground_y(nx, nz);
+        step_up = ground_y - ey;
+        vertical_velocity = session->spawned_entity_vertical_velocity[i];
+        on_ground = session->spawned_entity_on_ground[i];
+
+        if (step_up > 0.0 && step_up <= 1.25) {
+            ny = ground_y;
+            vertical_velocity = 0.0;
+            on_ground = 1;
+        } else if (ey > ground_y + 0.001) {
+            vertical_velocity -= 0.08;
+            if (vertical_velocity < -1.5) {
+                vertical_velocity = -1.5;
+            }
+            ny = ey + vertical_velocity;
+            if (ny <= ground_y) {
+                ny = ground_y;
+                vertical_velocity = 0.0;
+                on_ground = 1;
+            } else {
+                on_ground = 0;
+            }
+        } else {
+            ny = ground_y;
+            vertical_velocity = 0.0;
+            on_ground = 1;
+        }
+
+        session->spawned_entity_vertical_velocity[i] = vertical_velocity;
+        session->spawned_entity_on_ground[i] = on_ground;
+
+        (void)entity_registry_update_xyz(&session->entity_registry, ent_id, nx, ny, nz);
+
+        was_visible = session->spawned_entity_visible[i];
+        reconcile_entity_visibility(session,
+                                    socket_fd,
+                                    ent_id,
+                                    ent_type,
+                                    0,
+                                    &session->spawned_entity_visible[i]);
+
+        if (was_visible && session->spawned_entity_visible[i]) {
+            double dx_raw = (nx - ex) * 4096.0;
+            double dy_raw = (ny - ey) * 4096.0;
+            double dz_raw = (nz - ez) * 4096.0;
+            uint8_t mv_buf[64];
+            size_t mv_len;
+
+            if (dx_raw >= -32767.0 && dx_raw <= 32767.0 &&
+                dy_raw >= -32767.0 && dy_raw <= 32767.0 &&
+                dz_raw >= -32767.0 && dz_raw <= 32767.0) {
+                mv_len = build_move_entity_pos_packet(mv_buf,
+                                                      sizeof(mv_buf),
+                                                      ent_id,
+                                                      (int16_t)dx_raw,
+                                                      (int16_t)dy_raw,
+                                                      (int16_t)dz_raw,
+                                                      on_ground);
+            } else {
+                mv_len = build_entity_position_sync_packet(mv_buf,
+                                                           sizeof(mv_buf),
+                                                           ent_id,
+                                                           nx,
+                                                           ny,
+                                                           nz,
+                                                           0.0,
+                                                           vertical_velocity,
+                                                           0.0,
+                                                           0.0f,
+                                                           0.0f,
+                                                           on_ground);
+            }
+
+            send_post_compression_packet(socket_fd, mv_buf, mv_len);
+            session->entity_stats_move_packets_sent += 1;
+
+            {
+                double look_x = has_player_anchor ? player_x : nx + (target_x - nx);
+                double look_z = has_player_anchor ? player_z : nz + (target_z - nz);
+                double lx = look_x - nx;
+                double lz = look_z - nz;
+                double yaw = -atan2(lx, lz) * 180.0 / 3.14159265359;
+                uint8_t hr_buf[16];
+                size_t hr_len;
+
+                if (yaw < 0.0) {
+                    yaw += 360.0;
+                }
+
+                hr_len = build_set_head_rotation_packet(hr_buf, sizeof(hr_buf), ent_id, (float)yaw);
+                send_post_compression_packet(socket_fd, hr_buf, hr_len);
+                session->entity_stats_head_packets_sent += 1;
+            }
+        } else if (!session->spawned_entity_visible[i]) {
+            session->entity_stats_update_culled += 1;
+        }
+    }
+}
+
+static void enforce_tracked_entity_limits(client_session_t *session,
+                                          socket_handle_t socket_fd,
+                                          time_t now_ts,
+                                          int has_player_anchor,
+                                          double player_x,
+                                          double player_z) {
+    int despawn_seconds;
+    int despawn_distance_blocks;
+    int max_tracked;
+    double despawn_distance_sq = 0.0;
+    size_t i = 0;
+
+    if (session == NULL) {
+        return;
+    }
+
+    despawn_seconds = session->server_config.entity_despawn_seconds;
+    despawn_distance_blocks = session->server_config.entity_despawn_distance_blocks;
+    max_tracked = session->server_config.entity_max_tracked;
+
+    if (max_tracked < 1) {
+        max_tracked = 1;
+    }
+    if (max_tracked > (int)(sizeof(session->spawned_entity_ids) / sizeof(session->spawned_entity_ids[0]))) {
+        max_tracked = (int)(sizeof(session->spawned_entity_ids) / sizeof(session->spawned_entity_ids[0]));
+    }
+
+    if (despawn_distance_blocks > 0) {
+        despawn_distance_sq = (double)despawn_distance_blocks * (double)despawn_distance_blocks;
+    }
+
+    while (i < session->spawned_entity_count) {
+        int remove_entity = 0;
+        int32_t ent_id = session->spawned_entity_ids[i];
+        int32_t ent_type = session->spawned_entity_types[i];
+        int was_visible = session->spawned_entity_visible[i];
+        double ex = 0.0, ey = 0.0, ez = 0.0;
+
+        if (ent_type == PLAY774_ENTITY_TYPE_ITEM) {
+            i += 1;
+            continue;
+        }
+
+        if (despawn_seconds > 0) {
+            time_t born = session->spawned_entity_birth_at[i];
+            if (born > 0 && now_ts >= born && (now_ts - born) >= despawn_seconds) {
+                remove_entity = 1;
+            }
+        }
+
+        if (!remove_entity && despawn_distance_sq > 0.0 && has_player_anchor) {
+            if (find_entity_position(&session->entity_registry, ent_id, &ex, &ey, &ez)) {
+                double dx = ex - player_x;
+                double dz = ez - player_z;
+                double dist_sq = dx * dx + dz * dz;
+                if (dist_sq > despawn_distance_sq) {
+                    remove_entity = 1;
+                }
+            }
+        }
+
+        if (!remove_entity && session->spawned_entity_count > (size_t)max_tracked) {
+            remove_entity = 1;
+        }
+
+        if (remove_entity) {
+            if (was_visible) {
+                uint8_t rem_buf[64];
+                size_t rem_len = build_entity_destroy_packet(rem_buf, sizeof(rem_buf), &ent_id, 1);
+                send_post_compression_packet(socket_fd, rem_buf, rem_len);
+                session->entity_stats_destroy_packets_sent += 1;
+            }
+            (void)entity_manager_queue_remove(&session->entity_registry,
+                                              &session->entity_manager,
+                                              ent_id);
+            (void)untrack_spawned_entity_id(session, ent_id);
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+static size_t count_tracked_roaming_mobs(const client_session_t *session) {
+    size_t i;
+    size_t count = 0;
+
+    if (session == NULL) {
+        return 0;
+    }
+
+    for (i = 0; i < session->spawned_entity_count; ++i) {
+        if (session->spawned_entity_types[i] != PLAY774_ENTITY_TYPE_ITEM) {
+            count += 1;
+        }
+    }
+
+    return count;
+}
+
+static size_t refill_tracked_roaming_mobs(client_session_t *session,
+                                          socket_handle_t socket_fd,
+                                          uint64_t tick,
+                                          int has_player_anchor,
+                                          double player_x,
+                                          double player_z) {
+    size_t active_mobs;
+    size_t to_spawn;
+    size_t i;
+    size_t tracked_cap;
+    size_t max_tracked;
+    size_t spawned = 0;
+    double base_x;
+    double base_z;
+    double base_radius;
+
+    if (session == NULL) {
+        return 0;
+    }
+
+    if (session->server_config.entity_target_active_mobs <= 0) {
+        return 0;
+    }
+
+    tracked_cap = sizeof(session->spawned_entity_ids) / sizeof(session->spawned_entity_ids[0]);
+    max_tracked = (size_t)session->server_config.entity_max_tracked;
+    if (max_tracked > tracked_cap) {
+        max_tracked = tracked_cap;
+    }
+
+    active_mobs = count_tracked_roaming_mobs(session);
+    if (active_mobs >= (size_t)session->server_config.entity_target_active_mobs) {
+        return 0;
+    }
+
+    to_spawn = (size_t)session->server_config.entity_target_active_mobs - active_mobs;
+    if (to_spawn > 8) {
+        to_spawn = 8;
+    }
+
+    if (session->spawned_entity_count >= max_tracked) {
+        return 0;
+    }
+
+    if (to_spawn > (max_tracked - session->spawned_entity_count)) {
+        to_spawn = max_tracked - session->spawned_entity_count;
+    }
+
+    base_x = has_player_anchor ? player_x : (double)(session->stream_state.stream_center_chunk_x * 16 + 8);
+    base_z = has_player_anchor ? player_z : (double)(session->stream_state.stream_center_chunk_z * 16 + 8);
+    base_radius = (double)session->server_config.entity_roam_radius_blocks;
+    if (base_radius < 2.0) {
+        base_radius = 2.0;
+    }
+
+    for (i = 0; i < to_spawn; ++i) {
+        int32_t mob_id = 0;
+        int32_t mob_type = pick_roaming_mob_type((size_t)(tick + i));
+        int tracked_idx = -1;
+        double phase = ((double)((tick + i * 97ULL) % 2400ULL)) * 0.00261799387799;
+        double radius = base_radius * (0.70 + (double)(i % 4) * 0.10);
+        double sx = base_x + cos(phase) * radius;
+        double sz = base_z + sin(phase) * radius;
+        double sy = resolve_generated_ground_y(sx, sz);
+
+        if (!entity_manager_queue_spawn_auto(&session->entity_registry,
+                                             &session->entity_manager,
+                                             ENTITY_KIND_MOB,
+                                             sx,
+                                             sy,
+                                             sz,
+                                             &mob_id)) {
+            continue;
+        }
+
+        if (track_spawned_entity_id(session, mob_id, mob_type)) {
+            tracked_idx = find_tracked_spawned_entity_index(session, mob_id);
+        }
+
+        if (tracked_idx >= 0) {
+            session->spawned_entity_visible[tracked_idx] = 0;
+            reconcile_entity_visibility(session,
+                                        socket_fd,
+                                        mob_id,
+                                        mob_type,
+                                        0,
+                                        &session->spawned_entity_visible[tracked_idx]);
+            spawned += 1;
+        }
+    }
+
+    return spawned;
+}
+
 static void send_post_compression_packet(socket_handle_t socket_fd, const uint8_t *packet, size_t packet_len) {
     if (packet == NULL || packet_len == 0) {
         if (g_log_packet_framing) {
@@ -3961,6 +4345,7 @@ static void run_play_state_loop(client_session_t *session,
         time_t last_keepalive = time(NULL);
         time_t last_client_activity = time(NULL);
         time_t last_entity_event_log = time(NULL);
+        time_t last_entity_refill = time(NULL);
         double last_activity_x = 0.0;
         double last_activity_z = 0.0;
         int has_last_activity_position = 0;
@@ -4175,6 +4560,48 @@ static void run_play_state_loop(client_session_t *session,
                 }
             }
 
+            if (session->server_config.enable_experimental_entities &&
+                session->server_config.enable_experimental_entity_packets &&
+                session->client_protocol_version == 774) {
+                tick_tracked_mob_movement(session,
+                                          socket_fd,
+                                          tick,
+                                          has_last_activity_position,
+                                          last_activity_x,
+                                          last_activity_z);
+                enforce_tracked_entity_limits(session,
+                                              socket_fd,
+                                              now,
+                                              has_last_activity_position,
+                                              last_activity_x,
+                                              last_activity_z);
+
+                if (now - last_entity_refill >= session->server_config.entity_respawn_interval_seconds) {
+                    size_t active_before_refill = count_tracked_roaming_mobs(session);
+                    size_t spawned_by_refill;
+                    size_t active_after_refill;
+                    spawned_by_refill = refill_tracked_roaming_mobs(session,
+                                                                    socket_fd,
+                                                                    tick,
+                                                                    has_last_activity_position,
+                                                                    last_activity_x,
+                                                                    last_activity_z);
+                    active_after_refill = count_tracked_roaming_mobs(session);
+                    if (session->server_config.log_play_session_summary &&
+                        (spawned_by_refill > 0 || active_before_refill < (size_t)session->server_config.entity_target_active_mobs)) {
+                        printf("[ENTITY_REFILL] active=%zu target=%d spawned=%zu after=%zu tracked=%zu cap=%d\n",
+                               active_before_refill,
+                               session->server_config.entity_target_active_mobs,
+                               spawned_by_refill,
+                               active_after_refill,
+                               session->spawned_entity_count,
+                               session->server_config.entity_max_tracked);
+                        fflush(stdout);
+                    }
+                    last_entity_refill = now;
+                }
+            }
+
             if (session->server_config.play_idle_timeout_seconds > 0 &&
                 now - last_client_activity >= session->server_config.play_idle_timeout_seconds) {
                 printf("Closing idle play session after %d seconds without client traffic.\n",
@@ -4325,11 +4752,18 @@ static void run_play_state_loop(client_session_t *session,
                                     double dist_sq = dx * dx + dy * dy + dz * dz;
 
                                     if (dist_sq <= pickup_radius_sq) {
+                                        uint8_t take_buf[64];
+                                        size_t take_len = build_take_item_entity_packet(take_buf,
+                                                                                        sizeof(take_buf),
+                                                                                        ent_id,
+                                                                                        1,
+                                                                                        1);
                                         uint8_t rem_buf[64];
                                         size_t rem_len = build_entity_destroy_packet(rem_buf,
                                                                                      sizeof(rem_buf),
                                                                                      &ent_id,
                                                                                      1);
+                                        send_post_compression_packet(socket_fd, take_buf, take_len);
                                         send_post_compression_packet(socket_fd, rem_buf, rem_len);
                                         session->entity_stats_destroy_packets_sent += 1;
                                         (void)entity_manager_queue_remove(&session->entity_registry,
@@ -4346,21 +4780,49 @@ static void run_play_state_loop(client_session_t *session,
                     }
 
                     if (play_pid == PLAY774_C2S_BLOCK_DIG) {
+                        int parsed_dig = 0;
                         int32_t dig_status = -1;
                         int32_t block_x = 0, block_y = 0, block_z = 0;
+                        int32_t dig_sequence = -1;
 
-                            if (try_parse_block_dig_packet_774(play_payload,
-                                                        play_payload_len,
-                                                        &dig_status,
-                                                        &block_x,
-                                                        &block_y,
-                                                        &block_z) &&
+                            parsed_dig = try_parse_block_dig_packet_774(play_payload,
+                                                                         play_payload_len,
+                                                                         &dig_status,
+                                                                         &block_x,
+                                                                         &block_y,
+                                                                         &block_z,
+                                                                         &dig_sequence);
+                            if (parsed_dig) {
+                            uint8_t ack_buf[32];
+                            size_t ack_len = build_ack_block_change_packet(ack_buf,
+                                                                            sizeof(ack_buf),
+                                                                            dig_sequence);
+                            send_post_compression_packet(socket_fd, ack_buf, ack_len);
+                        }
+
+                            if (parsed_dig &&
                                (dig_status == PLAY774_BLOCK_DIG_FINISH ||
                                 (dig_status == PLAY774_BLOCK_DIG_START && session->server_config.game_mode == 1))) {
                             int32_t drop_entity_id = 0;
                             double drop_x = (double)block_x + 0.5;
                             double drop_y = (double)block_y + 0.5;
                             double drop_z = (double)block_z + 0.5;
+                            gen_block_kind_t broken_kind = generated_world_block_kind(block_x, block_y, block_z);
+
+                            if (broken_kind == GEN_BLOCK_AIR || broken_kind == GEN_BLOCK_WATER) {
+                                goto block_dig_done;
+                            }
+
+                            {
+                                uint8_t bu_buf[32];
+                                size_t bu_len = build_block_update_packet(bu_buf,
+                                                                          sizeof(bu_buf),
+                                                                          block_x,
+                                                                          block_y,
+                                                                          block_z,
+                                                                          PLAY774_BLOCK_STATE_AIR);
+                                send_post_compression_packet(socket_fd, bu_buf, bu_len);
+                            }
 
                             if (should_spawn_block_drop(session,
                                                         block_x,
@@ -4395,10 +4857,14 @@ static void run_play_state_loop(client_session_t *session,
                                 send_post_compression_packet(socket_fd, se_buf, se_len);
                                 {
                                     uint8_t item_md_buf[64];
+                                    int32_t item_id = PLAY774_ITEM_ID_STONE;
+                                    if (broken_kind == GEN_BLOCK_SAND) {
+                                        item_id = 93; /* minecraft:sand */
+                                    }
                                     size_t item_md_len = build_set_item_entity_slot_packet(item_md_buf,
                                                                                            sizeof(item_md_buf),
                                                                                            drop_entity_id,
-                                                                                           PLAY774_ITEM_ID_STONE,
+                                                                                           item_id,
                                                                                            1);
                                     if (item_md_len > 0) {
                                         send_post_compression_packet(socket_fd, item_md_buf, item_md_len);
@@ -4406,6 +4872,8 @@ static void run_play_state_loop(client_session_t *session,
                                 }
                                 session->entity_stats_spawn_packets_sent += 1;
                             }
+block_dig_done:
+                            ;
                         }
                     }
 
@@ -5188,12 +5656,21 @@ static void handle_client_connection(client_session_t *session) {
         // Now parse_ptr should be at the start of Login Start packet
         if (parse_len > 0) {
             // We have data after the handshake - copy it to login_buf
-            login_bytes = parse_len;
+            if (parse_len > sizeof(login_buf)) {
+                parse_len = sizeof(login_buf);
+            }
+#ifdef _WIN32
+            login_bytes = (parse_len > (size_t)INT_MAX) ? INT_MAX : (int)parse_len;
+#else
+            login_bytes = (ssize_t)parse_len;
+#endif
             memcpy(login_buf, parse_ptr, parse_len);
-            printf("[LOGIN] Found %zd bytes after handshake (hex):", parse_len);
-            for (size_t i = 0; i < (parse_len < 20 ? parse_len : 20); i++) printf(" %02X", parse_ptr[i]);
-            if (parse_len > 20) printf(" ...");
-            printf("\n");
+            if (g_log_packet_framing) {
+                printf("[LOGIN] Found %zd bytes after handshake (hex):", parse_len);
+                for (size_t i = 0; i < (parse_len < 20 ? parse_len : 20); i++) printf(" %02X", parse_ptr[i]);
+                if (parse_len > 20) printf(" ...");
+                printf("\n");
+            }
         }
     }
 
@@ -5223,10 +5700,12 @@ static void handle_client_connection(client_session_t *session) {
     {
         const uint8_t *lptr = login_buf;
         size_t llen = login_bytes;
-        printf("[LOGIN] Parsing %zd bytes from login_buf (hex):", llen);
-        for (size_t i = 0; i < (llen < 20 ? llen : 20); i++) printf(" %02X", lptr[i]);
-        if (llen > 20) printf(" ...");
-        printf("\n");
+        if (g_log_packet_framing) {
+            printf("[LOGIN] Parsing %zd bytes from login_buf (hex):", llen);
+            for (size_t i = 0; i < (llen < 20 ? llen : 20); i++) printf(" %02X", lptr[i]);
+            if (llen > 20) printf(" ...");
+            printf("\n");
+        }
         
         int32_t lplen = read_varint(&lptr, &llen);
         printf("[LOGIN] Packet length varint: %d, remaining: %zd\n", lplen, llen);
@@ -5285,9 +5764,11 @@ static void handle_client_connection(client_session_t *session) {
                     comp_buf,
                     sizeof(comp_buf),
                     server_config.compression_threshold);
-                printf("Set Compression packet (hex): ");
-                for (size_t i = 0; i < comp_buf_len; ++i) printf("%02X ", comp_buf[i]);
-                printf("\n");
+                if (g_log_packet_framing) {
+                    printf("Set Compression packet (hex): ");
+                    for (size_t i = 0; i < comp_buf_len; ++i) printf("%02X ", comp_buf[i]);
+                    printf("\n");
+                }
 
                 // Send Set Compression with a single frame (not double-framed)
 #ifdef _WIN32
@@ -5310,9 +5791,11 @@ static void handle_client_connection(client_session_t *session) {
                 uint8_t uuid[16];
                 extern void write_offline_mode_uuid(uint8_t *, const char *);
                 write_offline_mode_uuid(uuid, username);
-                printf("Login Success UUID bytes (offline-mode from username: %s): ", username);
-                for (size_t i = 0; i < sizeof(uuid); ++i) printf("%02X ", uuid[i]);
-                printf("\n");
+                if (g_log_packet_framing) {
+                    printf("Login Success UUID bytes (offline-mode from username: %s): ", username);
+                    for (size_t i = 0; i < sizeof(uuid); ++i) printf("%02X ", uuid[i]);
+                    printf("\n");
+                }
 
                 // Encode username as MC String
                 uint8_t unamebuf[64];
@@ -5328,9 +5811,11 @@ static void handle_client_connection(client_session_t *session) {
                 memcpy(unamebuf + uname_varint, username, uname_len);
 
                 // Print username encoding for debug
-                printf("Login Success username (len=%zu): ", uname_len);
-                for (size_t i = 0; i < uname_varint + uname_len; ++i) printf("%02X ", unamebuf[i]);
-                printf("\n");
+                if (g_log_packet_framing) {
+                    printf("Login Success username (len=%zu): ", uname_len);
+                    for (size_t i = 0; i < uname_varint + uname_len; ++i) printf("%02X ", unamebuf[i]);
+                    printf("\n");
+                }
 
 
                 // Build Login Success packet (raw, no length prefix)
@@ -5351,16 +5836,20 @@ static void handle_client_connection(client_session_t *session) {
                 offset += write_varint(packet + offset, 0);
 
                 // Print raw Login Success packet (no length prefix)
-                printf("Raw Login Success packet (hex): ");
-                for (size_t i = 0; i < offset; ++i) printf("%02X ", packet[i]);
-                printf("\n");
+                if (g_log_packet_framing) {
+                    printf("Raw Login Success packet (hex): ");
+                    for (size_t i = 0; i < offset; ++i) printf("%02X ", packet[i]);
+                    printf("\n");
+                }
 
                 // Login Success double-framing (pass only raw packet, no length prefix)
                 uint8_t double_framed[512];
                 size_t double_framed_len = double_frame_packet(double_framed, sizeof(double_framed), packet, offset);
-                printf("Double Framed Login Success packet (hex): ");
-                for (size_t i = 0; i < double_framed_len; ++i) printf("%02X ", double_framed[i]);
-                printf("\n");
+                if (g_log_packet_framing) {
+                    printf("Double Framed Login Success packet (hex): ");
+                    for (size_t i = 0; i < double_framed_len; ++i) printf("%02X ", double_framed[i]);
+                    printf("\n");
+                }
                 // Send Login Success
 #ifdef _WIN32
                 send(new_socket, (const char*)double_framed, (int)double_framed_len, 0);
@@ -5378,9 +5867,11 @@ static void handle_client_connection(client_session_t *session) {
                     ssize_t ack_bytes = recv(new_socket, ack_buf, sizeof(ack_buf), 0);
 #endif
                     if (ack_bytes > 0) {
-                        printf("Received packet after Login Success: ");
-                        for (int i = 0; i < ack_bytes; ++i) printf("%02X ", ack_buf[i]);
-                        printf("\n");
+                        if (g_log_packet_framing) {
+                            printf("Received packet after Login Success: ");
+                            for (int i = 0; i < ack_bytes; ++i) printf("%02X ", ack_buf[i]);
+                            printf("\n");
+                        }
                         {
                             int32_t ackpid = -1;
                             if (!read_post_compression_packet_id(ack_buf, (size_t)ack_bytes, &ackpid)) {
@@ -5448,7 +5939,9 @@ static void handle_client_connection(client_session_t *session) {
                                                 printf("Failed to parse config packet during known-packs negotiation.\n");
                                                 continue;
                                             }
-                                            printf("Parsed config packet ID: %d\n", kp_pid);
+                                            if (g_log_packet_framing) {
+                                                printf("Parsed config packet ID: %d\n", kp_pid);
+                                            }
                                             if (kp_pid == 0x07) {
                                                 got_known_packs = 1;
                                                 break;
@@ -5669,7 +6162,9 @@ static void handle_client_connection(client_session_t *session) {
                                                 continue;
                                             }
 
-                                            printf("Parsed config packet ID: %d\n", cfg_pid);
+                                            if (g_log_packet_framing) {
+                                                printf("Parsed config packet ID: %d\n", cfg_pid);
+                                            }
                                             if (cfg_pid == 0x03) {
                                                 got_finish_ack = 1;
                                                 break;
@@ -6068,6 +6563,58 @@ static void handle_client_connection(client_session_t *session) {
                                                             session->mock_entity_b_visible = 1;
 
                                                             printf("Sent Spawn Entity for mock entities %d and %d.\n", mock_a, mock_b);
+                                                        }
+                                                    }
+
+                                                    if (server_config.enable_experimental_entity_packets &&
+                                                        session->client_protocol_version == 774) {
+                                                        static const int32_t starter_mob_types[] = {
+                                                            30, 100, 111, 150, 115, 32, 124, 41
+                                                        };
+                                                        size_t type_count = sizeof(starter_mob_types) / sizeof(starter_mob_types[0]);
+                                                        size_t mob_count = (size_t)server_config.entity_starter_spawn_count;
+                                                        size_t spawned_mobs = 0;
+
+                                                        if (mob_count > 32) {
+                                                            mob_count = 32;
+                                                        }
+
+                                                        for (size_t mi = 0; mi < mob_count; ++mi) {
+                                                            int32_t mob_id = 0;
+                                                            int tracked_idx = -1;
+                                                            double angle = ((double)mi / (double)mob_count) * 6.28318530718;
+                                                            double sx = (double)player_spawn_x + cos(angle) * 6.0;
+                                                            double sz = (double)player_spawn_z + sin(angle) * 6.0;
+                                                            double sy = resolve_generated_ground_y(sx, sz);
+
+                                                            if (!entity_manager_queue_spawn_auto(&session->entity_registry,
+                                                                                                 &session->entity_manager,
+                                                                                                 ENTITY_KIND_MOB,
+                                                                                                 sx,
+                                                                                                 sy,
+                                                                                                 sz,
+                                                                                                 &mob_id)) {
+                                                                continue;
+                                                            }
+
+                                                            if (track_spawned_entity_id(session, mob_id, starter_mob_types[mi % type_count])) {
+                                                                tracked_idx = find_tracked_spawned_entity_index(session, mob_id);
+                                                            }
+
+                                                            if (tracked_idx >= 0) {
+                                                                session->spawned_entity_visible[tracked_idx] = 0;
+                                                                reconcile_entity_visibility(session,
+                                                                                            new_socket,
+                                                                                            mob_id,
+                                                                                            starter_mob_types[mi % type_count],
+                                                                                            0,
+                                                                                            &session->spawned_entity_visible[tracked_idx]);
+                                                                spawned_mobs += 1;
+                                                            }
+                                                        }
+
+                                                        if (spawned_mobs > 0) {
+                                                            printf("Spawned %zu roaming starter mobs for free-movement testing.\n", spawned_mobs);
                                                         }
                                                     }
                                                 }

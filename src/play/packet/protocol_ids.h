@@ -22,6 +22,8 @@
 #define PLAY774_PKT_SPAWN_ENTITY          0x01  // add_entity
 // 0x02 = animate (Entity Animation) — NOT an orb spawn
 #define PLAY774_PKT_ANIMATE               0x02  // animate
+#define PLAY774_PKT_ACK_BLOCK_CHANGE      0x04  // block_changed_ack
+#define PLAY774_PKT_BLOCK_UPDATE          0x08  // block_update
 #define PLAY774_PKT_ENTITY_POSITION_SYNC  0x23  // entity_position_sync (teleport, >8 blocks)
 #define PLAY774_PKT_PLAYER_INFO_REMOVE    0x43  // player_info_remove
 #define PLAY774_PKT_PLAYER_INFO_UPDATE    0x44  // player_info_update
@@ -33,6 +35,7 @@
 #define PLAY774_PKT_MOVE_ENTITY_POS       0x33  // move_entity_pos (delta, <=8 blocks)
 #define PLAY774_PKT_MOVE_ENTITY_POS_ROT   0x34  // move_entity_pos_rot
 #define PLAY774_PKT_MOVE_ENTITY_ROT       0x36  // move_entity_rot
+#define PLAY774_PKT_TAKE_ITEM_ENTITY      0x7A  // take_item_entity
 // Synchronize Vehicle Position (0x7B) is separate from entity_position_sync
 
 #endif

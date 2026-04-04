@@ -216,6 +216,27 @@ static int assign_config_value(server_config_t *config, const char *key, const c
     if (strcmp(key, "game_event_limited_crafting_value") == 0) {
         return parse_int_in_range(value, 0, 1, &config->game_event_limited_crafting_value);
     }
+    if (strcmp(key, "entity_starter_spawn_count") == 0) {
+        return parse_int_in_range(value, 0, 32, &config->entity_starter_spawn_count);
+    }
+    if (strcmp(key, "entity_roam_radius_blocks") == 0) {
+        return parse_int_in_range(value, 1, 64, &config->entity_roam_radius_blocks);
+    }
+    if (strcmp(key, "entity_despawn_distance_blocks") == 0) {
+        return parse_int_in_range(value, 0, 512, &config->entity_despawn_distance_blocks);
+    }
+    if (strcmp(key, "entity_despawn_seconds") == 0) {
+        return parse_int_in_range(value, 0, 3600, &config->entity_despawn_seconds);
+    }
+    if (strcmp(key, "entity_max_tracked") == 0) {
+        return parse_int_in_range(value, 1, 256, &config->entity_max_tracked);
+    }
+    if (strcmp(key, "entity_target_active_mobs") == 0) {
+        return parse_int_in_range(value, 0, 256, &config->entity_target_active_mobs);
+    }
+    if (strcmp(key, "entity_respawn_interval_seconds") == 0) {
+        return parse_int_in_range(value, 1, 300, &config->entity_respawn_interval_seconds);
+    }
     if (strcmp(key, "rule_do_daylight_cycle") == 0) {
         return parse_bool_value(value, &config->game_rules.do_daylight_cycle);
     }
@@ -461,6 +482,13 @@ void set_server_config_defaults(server_config_t *config) {
     config->send_brand_packet = 1;
     config->enable_experimental_entities = 0;
     config->enable_experimental_entity_packets = 0;
+    config->entity_starter_spawn_count = 8;
+    config->entity_roam_radius_blocks = 8;
+    config->entity_despawn_distance_blocks = 96;
+    config->entity_despawn_seconds = 300;
+    config->entity_max_tracked = 64;
+    config->entity_target_active_mobs = 12;
+    config->entity_respawn_interval_seconds = 8;
     config->send_game_rules_packet = 0;
     config->send_wait_for_level_chunks_event = 1;
     config->game_event_respawn_screen_value = 0;

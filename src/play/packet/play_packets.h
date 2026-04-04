@@ -12,6 +12,15 @@ size_t build_game_event_packet(uint8_t *outbuf, size_t outbuf_size, uint8_t even
 size_t build_keep_alive_packet(uint8_t *outbuf, size_t outbuf_size, int64_t keep_alive_id);
 size_t build_brand_packet(uint8_t *outbuf, size_t outbuf_size, const char *brand_name);
 size_t build_game_rules_packet(uint8_t *outbuf, size_t outbuf_size, const game_rules_t *rules);
+size_t build_ack_block_change_packet(uint8_t *outbuf,
+                                     size_t outbuf_size,
+                                     int32_t sequence_id);
+size_t build_block_update_packet(uint8_t *outbuf,
+                                 size_t outbuf_size,
+                                 int32_t x,
+                                 int32_t y,
+                                 int32_t z,
+                                 int32_t block_state_id);
 size_t build_spawn_experience_orb_packet(uint8_t *outbuf,
 										 size_t outbuf_size,
 										 int32_t entity_id,
@@ -66,5 +75,10 @@ size_t build_set_item_entity_slot_packet(uint8_t *outbuf,
                                          int32_t entity_id,
                                          int32_t item_id,
                                          int32_t item_count);
+size_t build_take_item_entity_packet(uint8_t *outbuf,
+                                     size_t outbuf_size,
+                                     int32_t collected_entity_id,
+                                     int32_t collector_entity_id,
+                                     int32_t item_count);
 
 #endif

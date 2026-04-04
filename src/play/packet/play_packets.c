@@ -150,6 +150,39 @@ size_t build_brand_packet(uint8_t *outbuf, size_t outbuf_size, const char *brand
     return offset;
 }
 
+size_t build_ack_block_change_packet(uint8_t *outbuf,
+                                     size_t outbuf_size,
+                                     int32_t sequence_id) {
+    size_t offset = 0;
+
+    if (outbuf == NULL || outbuf_size < 8) {
+        return 0;
+    }
+
+    offset += write_varint(outbuf + offset, PLAY774_PKT_ACK_BLOCK_CHANGE);
+    offset += write_varint(outbuf + offset, sequence_id);
+    return offset;
+}
+
+size_t build_block_update_packet(uint8_t *outbuf,
+                                 size_t outbuf_size,
+                                 int32_t x,
+                                 int32_t y,
+                                 int32_t z,
+                                 int32_t block_state_id) {
+    size_t offset = 0;
+
+    if (outbuf == NULL || outbuf_size < 16) {
+        return 0;
+    }
+
+    offset += write_varint(outbuf + offset, PLAY774_PKT_BLOCK_UPDATE);
+    write_position_be(outbuf + offset, x, y, z);
+    offset += 8;
+    offset += write_varint(outbuf + offset, block_state_id);
+    return offset;
+}
+
 size_t build_spawn_experience_orb_packet(uint8_t *outbuf,
                                          size_t outbuf_size,
                                          int32_t entity_id,
@@ -423,5 +456,27 @@ size_t build_set_item_entity_slot_packet(uint8_t *outbuf,
     // Metadata terminator.
     outbuf[offset++] = 0xFF;
 
+    return offset;
+}
+
+size_t build_take_item_entity_packet(uint8_t *outbuf,
+                                     size_t outbuf_size,
+                                     int32_t collected_entity_id,
+                                     int32_t collector_entity_id,
+                                     int32_t item_count) {
+    size_t offset = 0;
+
+    if (outbuf == NULL || outbuf_size < 16) {
+        return 0;
+    }
+
+    if (item_count < 1) {
+        item_count = 1;
+    }
+
+    offset += write_varint(outbuf + offset, PLAY774_PKT_TAKE_ITEM_ENTITY);
+    offset += write_varint(outbuf + offset, collected_entity_id);
+    offset += write_varint(outbuf + offset, collector_entity_id);
+    offset += write_varint(outbuf + offset, item_count);
     return offset;
 }

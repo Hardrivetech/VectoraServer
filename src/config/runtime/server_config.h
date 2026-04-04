@@ -49,6 +49,13 @@ typedef struct {
     int send_brand_packet;
     int enable_experimental_entities;
     int enable_experimental_entity_packets;
+    int entity_starter_spawn_count;
+    int entity_roam_radius_blocks;
+    int entity_despawn_distance_blocks;
+    int entity_despawn_seconds;
+    int entity_max_tracked;
+    int entity_target_active_mobs;
+    int entity_respawn_interval_seconds;
     int send_game_rules_packet;
     int send_wait_for_level_chunks_event;
     int game_event_respawn_screen_value;
